@@ -6,6 +6,11 @@ if command -v firma >/dev/null 2>&1; then
     command -v firma
     exit 0
 fi
+# Where install.sh puts it: agents often run a shell that lacks the user's PATH additions.
+if [ -x "$HOME/.local/bin/firma" ]; then
+    echo "$HOME/.local/bin/firma"
+    exit 0
+fi
 here="$(cd "$(dirname "$0")/.." && pwd)"
 case "$(uname -s)-$(uname -m)" in
     Darwin-*) bin="$here/bin/macos-universal/firma" ;;

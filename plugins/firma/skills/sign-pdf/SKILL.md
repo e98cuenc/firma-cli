@@ -28,7 +28,9 @@ A digital signature has legal effect on the user's behalf. Follow these rules ev
 
 Use the first one that works:
 
-1. `firma --version` (already installed on the PATH).
+1. `firma --version` (already installed on the PATH), else `~/.local/bin/firma --version`
+   (`%LOCALAPPDATA%\firma\firma.exe` on Windows): where the install scripts put it, which may be missing from
+   your shell's PATH. Never reinstall over a binary that works.
 2. The binary bundled with this skill, if present: `bin/<platform>/firma` next to this file
    (`macos-universal`, `x86_64-linux`, `aarch64-linux`, `x86_64-windows/firma.exe`).
    Run `scripts/locate.sh` (macOS/Linux) to print the right path.
