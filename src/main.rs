@@ -821,14 +821,17 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
         };
         println!("  certified:   by its author ({what})");
     }
+    if existing.iter().any(|f| f.signed) {
+        println!("  note:        earlier signatures are listed as recorded in the file, not verified");
+    }
     for f in &existing {
         if f.timestamp {
             println!("  time-stamp:  {} ({})", f.name, place(f));
         } else if f.signed {
-            let by = f.signer.as_ref().map(|s| format!(" by {s}")).unwrap_or_default();
+            let by = f.signer.as_ref().map(|s| format!(" by \"{s}\"")).unwrap_or_default();
             println!("  signed:      {}{by} ({})", f.name, place(f));
         } else {
-            println!("  empty field: {} ({}); sign into it with --field \"{}\"", f.name, place(f), f.name);
+            println!("  empty field: {} ({}); sign into it with --field {}", f.name, place(f), shell_quote(&f.name));
         }
     }
     pdf::sign::check_certification(&src.doc, root, a.field.is_some())?;
@@ -939,6 +942,15 @@ fn prompt_secret(prompt: &str, alternatives: &str) -> Result<String> {
     rpassword::prompt_password(prompt).map_err(|e| {
         anyhow::anyhow!("cannot ask for the password: no terminal available ({e}); provide it with {alternatives}")
     })
+}
+
+/// A name from a PDF as one literal shell argument (POSIX shells; PowerShell on Windows).
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("'{}'", s.replace('\'', "''"))
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// Text for a system dialog: no control characters or quotes that could fake its wording.

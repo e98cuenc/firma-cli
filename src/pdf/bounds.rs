@@ -1,7 +1,11 @@
 //! Bounds of what a form XObject actually draws, so that a signature can be trimmed to its ink.
 
-use lopdf::content::Content;
-use lopdf::{Dictionary, Document, Object, Stream};
+use std::collections::HashMap;
+use std::io::Read as _;
+use std::rc::Rc;
+
+use lopdf::content::{Content, Operation};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use super::{numbers, resolve};
 
@@ -9,13 +13,17 @@ type Matrix = [f64; 6];
 
 const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
+/// Decompressed size allowed per content stream, and in total.
+const MAX_STREAM: u64 = 16 << 20;
+const MAX_TOTAL: u64 = 64 << 20;
+
 /// Box, in the form's own space (before its /Matrix), around everything the form paints,
 /// clipped to its /BBox. `None` if it draws nothing or uses something this does not measure
 /// (text, shadings, inline images); then the /BBox is the best answer.
 pub fn ink_bounds(doc: &Document, form: &Stream) -> Option<[f64; 4]> {
     let bbox = numbers(doc, form.dict.get(b"BBox").ok()?).filter(|b| b.len() == 4)?;
-    let mut w = Walker { doc, bounds: None, budget: 200_000 };
-    w.run(form, None, IDENTITY, 0)?;
+    let mut w = Walker { doc, bounds: None, budget: 200_000, bytes_left: MAX_TOTAL, cache: HashMap::new() };
+    w.run(form, None, None, IDENTITY, 0)?;
     let b = w.bounds?;
     let (bx0, bx1) = (bbox[0].min(bbox[2]), bbox[0].max(bbox[2]));
     let (by0, by1) = (bbox[1].min(bbox[3]), bbox[1].max(bbox[3]));
@@ -44,6 +52,10 @@ struct Walker<'a> {
     bounds: Option<[f64; 4]>,
     /// Operations left: nested forms drawn many times could otherwise take forever.
     budget: u32,
+    /// Decompressed bytes left, against compression bombs.
+    bytes_left: u64,
+    /// Each nested form is decoded once, however many times it is drawn.
+    cache: HashMap<ObjectId, Rc<Content<Vec<Operation>>>>,
 }
 
 impl Walker<'_> {
@@ -55,14 +67,54 @@ impl Walker<'_> {
         b[3] = b[3].max(y + pad);
     }
 
-    fn run(&mut self, form: &Stream, parent: Option<&Dictionary>, ctm: Matrix, depth: u32) -> Option<()> {
+    /// The decoded operations of a content stream, within the size limits.
+    fn content(&mut self, form: &Stream, id: Option<ObjectId>) -> Option<Rc<Content<Vec<Operation>>>> {
+        if let Some(c) = id.and_then(|id| self.cache.get(&id)) {
+            return Some(c.clone());
+        }
+        let data = match form.dict.get(b"Filter").map(|f| resolve(self.doc, f)) {
+            Err(_) => form.content.clone(),
+            Ok(filter) => {
+                let name = match filter {
+                    Object::Name(n) => n.as_slice(),
+                    Object::Array(a) if a.len() == 1 => a[0].as_name().ok()?,
+                    _ => return None,
+                };
+                if name != b"FlateDecode" || form.dict.has(b"DecodeParms") {
+                    return None;
+                }
+                let mut out = Vec::new();
+                let limit = MAX_STREAM.min(self.bytes_left) + 1;
+                flate2::read::ZlibDecoder::new(form.content.as_slice()).take(limit).read_to_end(&mut out).ok()?;
+                out
+            }
+        };
+        let len = data.len() as u64;
+        if len > MAX_STREAM || len > self.bytes_left {
+            return None;
+        }
+        self.bytes_left -= len;
+        let content = Rc::new(Content::decode(&data).ok()?);
+        if let Some(id) = id {
+            self.cache.insert(id, content.clone());
+        }
+        Some(content)
+    }
+
+    fn run(
+        &mut self,
+        form: &Stream,
+        id: Option<ObjectId>,
+        parent: Option<&Dictionary>,
+        ctm: Matrix,
+        depth: u32,
+    ) -> Option<()> {
         if depth > 8 {
             return None;
         }
         let resources =
             form.dict.get(b"Resources").ok().and_then(|r| resolve(self.doc, r).as_dict().ok()).or(parent);
-        let data = form.get_plain_content().ok()?;
-        let content = Content::decode(&data).ok()?;
+        let content = self.content(form, id)?;
 
         let mut stack: Vec<(Matrix, f64, i64)> = Vec::new();
         let (mut ctm, mut width, mut join) = (ctm, 1.0, 0i64);
@@ -116,7 +168,9 @@ impl Walker<'_> {
                 ("Do", _) => {
                     let name = op.operands.first()?.as_name().ok()?;
                     let xobjects = resolve(self.doc, resources?.get(b"XObject").ok()?).as_dict().ok()?;
-                    let xobject = resolve(self.doc, xobjects.get(name).ok()?).as_stream().ok()?;
+                    let xobject_ref = xobjects.get(name).ok()?;
+                    let xobject_id = xobject_ref.as_reference().ok();
+                    let xobject = resolve(self.doc, xobject_ref).as_stream().ok()?;
                     match xobject.dict.get(b"Subtype").and_then(Object::as_name).ok()? {
                         b"Form" => {
                             let m = xobject
@@ -127,7 +181,7 @@ impl Walker<'_> {
                                 .filter(|m| m.len() == 6)
                                 .map(|m| [m[0], m[1], m[2], m[3], m[4], m[5]])
                                 .unwrap_or(IDENTITY);
-                            self.run(xobject, resources, concat(&m, &ctm), depth + 1)?;
+                            self.run(xobject, xobject_id, resources, concat(&m, &ctm), depth + 1)?;
                         }
                         b"Image" => {
                             for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
@@ -210,6 +264,17 @@ mod tests {
         };
         assert!(nested(3).is_some());
         assert!(nested(7).is_none(), "over budget");
+    }
+
+    #[test]
+    fn gives_up_on_compression_bombs() {
+        use std::io::Write as _;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(&vec![b' '; (MAX_STREAM + 1) as usize]).unwrap();
+        let bomb = e.finish().unwrap();
+        let mut f = Stream::new(dictionary! { "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()] }, bomb);
+        f.dict.set("Filter", "FlateDecode");
+        assert!(ink_bounds(&Document::new(), &f).is_none());
     }
 
     #[test]

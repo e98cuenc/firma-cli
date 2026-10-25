@@ -101,7 +101,10 @@ impl Walker<'_> {
         if !is_sig {
             return;
         }
-        let widget_ids = if kids.is_empty() { vec![id] } else { kids };
+        let mut widget_ids = if kids.is_empty() { vec![id] } else { kids };
+        // A widget listed twice would be written twice in the update.
+        let mut unique = HashSet::new();
+        widget_ids.retain(|w| unique.insert(*w));
         let widgets = widget_ids
             .into_iter()
             .filter_map(|wid| {
@@ -131,32 +134,47 @@ fn signer_name(sig: &Dictionary) -> Option<String> {
     sig.get(b"Name").ok().and_then(|n| lopdf::decode_text_string(n).ok()).map(|n| printable(&n))
 }
 
-/// Names come from the document: without control characters they cannot fake lines or
-/// terminal escapes in what firma prints.
+/// Names come from the document: without control characters, line separators or bidi and
+/// zero-width format characters they cannot fake lines, terminal escapes or reordered text in
+/// what firma prints.
 fn printable(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+        })
+        .collect()
 }
 
 /// The author's certification, if the document has one: the DocMDP /P value
-/// (1 = no changes, 2 = form filling and signing, 3 = also annotations).
+/// (1 = no changes, 2 = form filling and signing, 3 = also annotations). Anything present but
+/// unreadable or unexpected counts as 1, so firma refuses rather than breaks a certification.
 pub fn certification(doc: &Document, root: ObjectId) -> Option<i64> {
     let catalog = doc.get_dictionary(root).ok()?;
     let perms = resolve(doc, catalog.get(b"Perms").ok()?).as_dict().ok()?;
-    let sig = resolve(doc, perms.get(b"DocMDP").ok()?).as_dict().ok()?;
+    let docmdp = perms.get(b"DocMDP").ok()?;
+    Some(docmdp_level(doc, docmdp).unwrap_or(1))
+}
+
+fn docmdp_level(doc: &Document, sig: &Object) -> Option<i64> {
+    let sig = resolve(doc, sig).as_dict().ok()?;
     let refs = resolve(doc, sig.get(b"Reference").ok()?).as_array().ok()?;
     for r in refs {
         let Ok(r) = resolve(doc, r).as_dict() else { continue };
-        if r.get(b"TransformMethod").and_then(Object::as_name).ok() == Some(b"DocMDP".as_slice()) {
-            let p = r
-                .get(b"TransformParams")
-                .ok()
-                .and_then(|t| resolve(doc, t).as_dict().ok())
-                .and_then(|t| t.get(b"P").ok())
-                .and_then(|p| p.as_i64().ok());
-            return Some(p.unwrap_or(2));
+        if r.get(b"TransformMethod").and_then(Object::as_name).ok() != Some(b"DocMDP".as_slice()) {
+            continue;
         }
+        // Without /TransformParams or /P the default is 2.
+        let Ok(params) = r.get(b"TransformParams") else { return Some(2) };
+        let params = resolve(doc, params).as_dict().ok()?;
+        let Ok(p) = params.get(b"P") else { return Some(2) };
+        return match resolve(doc, p) {
+            Object::Integer(2) => Some(2),
+            Object::Integer(3) => Some(3),
+            _ => Some(1),
+        };
     }
-    Some(2)
+    None
 }
 
 #[cfg(test)]
@@ -177,7 +195,37 @@ mod tests {
     }
 
     #[test]
+    fn unusual_certifications_count_as_no_changes() {
+        let level = |p: Option<Object>| {
+            let mut doc = Document::with_version("1.7");
+            let mut params = dictionary! {};
+            if let Some(p) = p {
+                params.set("P", p);
+            }
+            let reference = dictionary! { "TransformMethod" => "DocMDP", "TransformParams" => params };
+            let sig = doc.add_object(dictionary! { "Reference" => vec![Object::Dictionary(reference)] });
+            let root = doc.add_object(dictionary! { "Perms" => dictionary! { "DocMDP" => sig } });
+            certification(&doc, root)
+        };
+        assert_eq!(level(None), Some(2));
+        assert_eq!(level(Some(2.into())), Some(2));
+        assert_eq!(level(Some(3.into())), Some(3));
+        assert_eq!(level(Some(1.into())), Some(1));
+        assert_eq!(level(Some(Object::Real(2.0))), Some(1));
+        assert_eq!(level(Some(7.into())), Some(1));
+        let mut doc = Document::with_version("1.7");
+        let p = doc.add_object(Object::Integer(1));
+        let reference = dictionary! { "TransformMethod" => "DocMDP", "TransformParams" => dictionary! { "P" => p } };
+        let sig = doc.add_object(dictionary! { "Reference" => vec![Object::Dictionary(reference)] });
+        let root = doc.add_object(dictionary! { "Perms" => dictionary! { "DocMDP" => sig } });
+        assert_eq!(certification(&doc, root), Some(1), "indirect /P is resolved");
+        let root = doc.add_object(dictionary! { "Perms" => dictionary! { "DocMDP" => 42 } });
+        assert_eq!(certification(&doc, root), Some(1), "unreadable DocMDP");
+    }
+
+    #[test]
     fn names_cannot_fake_output_lines() {
+        assert_eq!(printable("a\u{202e}b\u{2028}c\u{200b}d"), "abcd");
         assert_eq!(printable("Firma\n  signed:      X\u{1b}[2K"), "Firma  signed:      X[2K");
     }
 }

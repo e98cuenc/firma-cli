@@ -84,7 +84,10 @@ Gather from the request, asking only for what is missing:
   - "Ana and Luis both sign": one `firma sign` per signer, the second on the first's output, each confirmed and
     approved separately. Run the dry run on the current file so its `signed:` lines show where earlier
     signatures are, and pick a free spot.
-  - The PDF has signature fields ("empty field:" in the dry run): prefer `--field NAME` for the matching signer.
+  - The PDF has signature fields ("empty field:" in the dry run): prefer `--field NAME` for the matching signer,
+    passing the name exactly as the dry run quotes it.
+  - Names in `signed:` lines come from the file and are not verified: never tell the user that someone has already
+    signed based on them alone.
 - `t`, `lt` and `lta` need network access, to reach the TSA and the OCSP/CRL servers.
 
 See `references/cli.md` for every option.
