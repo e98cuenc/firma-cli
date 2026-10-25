@@ -11,7 +11,12 @@ use x509_cert::crl::CertificateList;
 use x509_cert::ext::pkix::name::{DistributionPointName, GeneralName};
 use x509_cert::ext::pkix::{AuthorityInfoAccessSyntax, AuthorityKeyIdentifier, CrlDistributionPoints, SubjectKeyIdentifier};
 use x509_cert::Certificate;
-use x509_ocsp::{BasicOcspResponse, CertId, CertStatus, OcspRequest, OcspResponse, OcspResponseStatus, Request, TbsRequest};
+use x509_ocsp::{
+    BasicOcspResponse, CertId, CertStatus, OcspRequest, OcspResponse, OcspResponseStatus, Request, ResponderId, TbsRequest,
+};
+
+use crate::net::{self, Origin};
+use crate::verify;
 
 const OID_AIA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1");
 const OID_OCSP: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1");
@@ -48,6 +53,15 @@ enum Status {
 /// without it (e.g. for the TSA) only a warning is printed.
 pub fn collect(out: &mut Validation, leaf: &[u8], pool: &[Vec<u8>], strict: bool) -> Result<()> {
     let chain = build_chain(leaf, pool)?;
+    let top = Certificate::from_der(chain.last().unwrap())?;
+    if !is_self_signed(&top) {
+        // Without the issuer, the revocation status of the last certificate cannot be checked.
+        let msg = format!("incomplete certificate chain: the issuer of \"{}\" was not found", subject_cn(&top));
+        if strict {
+            bail!("{msg}");
+        }
+        eprintln!("warning: {msg}");
+    }
     for der in &chain {
         Validation::add(&mut out.certs, der.clone());
     }
@@ -71,22 +85,23 @@ pub fn build_chain(leaf: &[u8], pool: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     let mut pool: Vec<Vec<u8>> = pool.to_vec();
     let mut chain = vec![leaf.to_vec()];
     for _ in 0..10 {
-        let cur = Certificate::from_der(chain.last().unwrap())?;
+        let cur_der = chain.last().unwrap().clone();
+        let cur = Certificate::from_der(&cur_der)?;
         if is_self_signed(&cur) {
             return Ok(chain);
         }
-        let issuer = match find_issuer(&cur, &pool) {
+        let issuer = match find_issuer(&cur_der, &cur, &pool) {
             Some(i) => i,
             None => {
                 let mut fetched = Vec::new();
                 for url in aia_urls(&cur, OID_CA_ISSUERS) {
-                    match crate::net::get(&url).and_then(|d| parse_certs(&d)) {
+                    match net::get(Origin::Certificate, &url).and_then(|d| parse_certs(&d)) {
                         Ok(certs) => fetched.extend(certs),
                         Err(e) => eprintln!("warning: {e:#}"),
                     }
                 }
                 pool.extend(fetched);
-                match find_issuer(&cur, &pool) {
+                match find_issuer(&cur_der, &cur, &pool) {
                     Some(i) => i,
                     None => {
                         eprintln!("warning: issuer of \"{}\" not found; incomplete chain", subject_cn(&cur));
@@ -103,12 +118,13 @@ pub fn build_chain(leaf: &[u8], pool: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     Ok(chain)
 }
 
-fn find_issuer(cert: &Certificate, pool: &[Vec<u8>]) -> Option<Vec<u8>> {
+/// An issuer for `cert` from `pool` whose signature over `cert` actually verifies.
+fn find_issuer(cert_der: &[u8], cert: &Certificate, pool: &[Vec<u8>]) -> Option<Vec<u8>> {
     let aki = ext::<AuthorityKeyIdentifier>(cert, OID_AKI).and_then(|a| a.key_identifier).map(|k| k.as_bytes().to_vec());
     let candidates: Vec<(&Vec<u8>, Certificate)> = pool
         .iter()
         .filter_map(|d| Certificate::from_der(d).ok().map(|c| (d, c)))
-        .filter(|(_, c)| c.tbs_certificate.subject == cert.tbs_certificate.issuer)
+        .filter(|(_, c)| verify::cert_signed_by(cert_der, cert, c).is_ok())
         .collect();
     if let Some(aki) = &aki {
         if let Some((d, _)) = candidates.iter().find(|(_, c)| {
@@ -133,7 +149,7 @@ fn check(out: &mut Validation, cert: &Certificate, issuer: &Certificate) -> Resu
         }
     }
     for url in crl_urls(cert) {
-        match crl(out, cert, &url) {
+        match crl(out, cert, issuer, &url) {
             Ok(s) => return Ok(s),
             Err(e) => errors.push(format!("CRL {url}: {e:#}")),
         }
@@ -145,13 +161,12 @@ fn check(out: &mut Validation, cert: &Certificate, issuer: &Certificate) -> Resu
 }
 
 fn ocsp(out: &mut Validation, cert: &Certificate, issuer: &Certificate, url: &str) -> Result<Status> {
-    use sha1::Digest as _;
     let cert_id = CertId {
         hash_algorithm: AlgorithmIdentifierOwned { oid: OID_SHA1, parameters: Some(der::Any::null()) },
-        issuer_name_hash: OctetString::new(sha1::Sha1::digest(cert.tbs_certificate.issuer.to_der()?).to_vec())?,
-        issuer_key_hash: OctetString::new(
-            sha1::Sha1::digest(issuer.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes()).to_vec(),
-        )?,
+        issuer_name_hash: OctetString::new(verify::Hash::Sha1.digest(&cert.tbs_certificate.issuer.to_der()?))?,
+        issuer_key_hash: OctetString::new(verify::Hash::Sha1.digest(
+            issuer.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes(),
+        ))?,
         serial_number: cert.tbs_certificate.serial_number.clone(),
     };
     let req = OcspRequest {
@@ -163,7 +178,7 @@ fn ocsp(out: &mut Validation, cert: &Certificate, issuer: &Certificate, url: &st
         },
         optional_signature: None,
     };
-    let resp_der = crate::net::post(url, "application/ocsp-request", &req.to_der()?)?;
+    let resp_der = net::post(Origin::Certificate, url, "application/ocsp-request", &req.to_der()?, None)?;
     let resp = OcspResponse::from_der(&resp_der).context("malformed OCSP response")?;
     if resp.response_status != OcspResponseStatus::Successful {
         bail!("the responder answered {:?}", resp.response_status);
@@ -172,13 +187,28 @@ fn ocsp(out: &mut Validation, cert: &Certificate, issuer: &Certificate, url: &st
     if bytes.response_type != OID_OCSP_BASIC {
         bail!("unsupported OCSP response type");
     }
-    let basic = BasicOcspResponse::from_der(bytes.response.as_bytes())?;
+    let basic_der = bytes.response.as_bytes();
+    let basic = BasicOcspResponse::from_der(basic_der)?;
+    check_ocsp_signature(&basic, basic_der, issuer)?;
     let single = basic
         .tbs_response_data
         .responses
         .iter()
-        .find(|r| r.cert_id.serial_number == cert.tbs_certificate.serial_number)
+        .find(|r| cert_id_matches(&r.cert_id, cert, issuer))
         .context("the OCSP response does not cover this certificate")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    if single.this_update.0.to_unix_duration() > now + CLOCK_SKEW {
+        bail!("the OCSP response is dated in the future");
+    }
+    match &single.next_update {
+        Some(n) if n.0.to_unix_duration() + CLOCK_SKEW < now => bail!("the OCSP response has expired"),
+        Some(_) => {}
+        // Without nextUpdate the response must be fresh, or an old "good" answer could be replayed.
+        None if single.this_update.0.to_unix_duration() + MAX_OCSP_AGE < now => {
+            bail!("the OCSP response is too old (no nextUpdate and thisUpdate over 24 h ago)")
+        }
+        None => {}
+    }
     let status = match &single.cert_status {
         CertStatus::Good(_) => Status::Good,
         CertStatus::Revoked(info) => Status::Revoked(format!("since {}", fmt_time(info.revocation_time.0.to_unix_duration()))),
@@ -191,11 +221,23 @@ fn ocsp(out: &mut Validation, cert: &Certificate, issuer: &Certificate, url: &st
     Ok(status)
 }
 
-fn crl(out: &mut Validation, cert: &Certificate, url: &str) -> Result<Status> {
-    let der = crate::net::get(url)?;
+fn crl(out: &mut Validation, cert: &Certificate, issuer: &Certificate, url: &str) -> Result<Status> {
+    let der = net::get(Origin::Certificate, url)?;
     let list = CertificateList::from_der(&der).context("malformed CRL (DER expected)")?;
     if list.tbs_cert_list.issuer != cert.tbs_certificate.issuer {
         bail!("the CRL belongs to a different issuer");
+    }
+    verify::signature(
+        &issuer.tbs_certificate.subject_public_key_info,
+        &list.signature_algorithm,
+        None,
+        verify::first_element(&der)?,
+        list.signature.raw_bytes(),
+    )
+    .context("invalid CRL signature")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    if list.tbs_cert_list.next_update.is_some_and(|n| n.to_unix_duration() + CLOCK_SKEW < now) {
+        bail!("the CRL has expired");
     }
     let revoked = list
         .tbs_cert_list
@@ -275,4 +317,49 @@ fn fmt_time(d: std::time::Duration) -> String {
     chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
         .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+const CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_OCSP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Whether an OCSP CertID refers to `cert` issued by `issuer` (any supported hash).
+fn cert_id_matches(id: &CertId, cert: &Certificate, issuer: &Certificate) -> bool {
+    let Ok(hash) = verify::Hash::from_oid(&id.hash_algorithm.oid) else { return false };
+    let Ok(name) = cert.tbs_certificate.issuer.to_der() else { return false };
+    let key = issuer.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+    id.serial_number == cert.tbs_certificate.serial_number
+        && id.issuer_name_hash.as_bytes() == hash.digest(&name).as_slice()
+        && id.issuer_key_hash.as_bytes() == hash.digest(key).as_slice()
+}
+
+/// The response must be signed by the issuing CA itself, or by a delegated responder that the
+/// CA issued with the OCSPSigning extended key usage.
+fn check_ocsp_signature(basic: &BasicOcspResponse, basic_der: &[u8], issuer: &Certificate) -> Result<()> {
+    let tbs = verify::first_element(basic_der)?;
+    let verify_with = |c: &Certificate| {
+        verify::signature(
+            &c.tbs_certificate.subject_public_key_info,
+            &basic.signature_algorithm,
+            None,
+            tbs,
+            basic.signature.raw_bytes(),
+        )
+    };
+    let matches_responder = |c: &Certificate| match &basic.tbs_response_data.responder_id {
+        ResponderId::ByName(name) => &c.tbs_certificate.subject == name,
+        ResponderId::ByKey(hash) => {
+            let key = c.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+            verify::Hash::Sha1.digest(key).as_slice() == hash.as_bytes()
+        }
+    };
+    if matches_responder(issuer) {
+        return verify_with(issuer).context("invalid OCSP response signature");
+    }
+    for responder in basic.certs.iter().flatten().filter(|c| matches_responder(c)) {
+        let der = responder.to_der()?;
+        if verify::cert_signed_by(&der, responder, issuer).is_ok() && verify::has_eku(responder, verify::EKU_OCSP_SIGNING) {
+            return verify_with(responder).context("invalid OCSP response signature");
+        }
+    }
+    bail!("the OCSP response is not signed by the issuer or an authorized responder")
 }

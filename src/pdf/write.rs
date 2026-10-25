@@ -120,7 +120,7 @@ pub fn incremental(
     }
 
     let mut new_trailer = Dictionary::new();
-    for key in [&b"Root"[..], b"Info", b"ID"] {
+    for key in [&b"Root"[..], b"Info", b"ID", b"Encrypt"] {
         if let Ok(v) = trailer.get(key) {
             new_trailer.set(key, v.clone());
         }

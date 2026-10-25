@@ -7,7 +7,9 @@ A single self-contained binary written in pure Rust: no Java, no OpenSSL, no ext
 - Several users, each with their own certificate (`.p12`/`.pfx`) and handwritten signature (image or vector).
 - Visible signature in one or more places, on any page, including rotated pages.
 - AutoFirma-style text stamp ("Digitally signed by …") so anyone can see the document is signed.
-- PAdES B-B, B-T (RFC 3161 time-stamp) and B-LT (embedded OCSP/CRL revocation data).
+- PAdES B-B, B-T (RFC 3161 time-stamp), B-LT (embedded OCSP/CRL revocation data) and B-LTA
+  (document time-stamp for long-term archival).
+- Signs encrypted PDFs (RC4, AES-128, AES-256), respecting their permissions.
 - Imports the signature you saved in macOS Preview, as vector graphics.
 
 ## Install
@@ -84,17 +86,21 @@ firma sign contract.pdf -u ana --at 1:120,40:70x30 --stamp-at 1:top-right \
   `\n` inserts a line break. For example, an AutoFirma-like Spanish stamp:
   `--text 'Firmado por {name} el {date} con un certificado emitido por {issuer}'`.
 - The password is prompted in the terminal. It can also come from `$FIRMA_PASSWORD` or `--password-file`.
+- Encrypted PDFs are supported. The new objects are encrypted with the document's own key, and the document's
+  permissions are respected (adding annotations must be allowed). If the PDF needs a password to open, it is
+  prompted, or read from `$FIRMA_PDF_PASSWORD` or `--pdf-password-file`.
 
 All boxes belong to a single signature. The PDF is modified through an incremental update, so existing
 signatures stay valid. The format is PAdES (`ETSI.CAdES.detached`, with signing-certificate-v2).
 `--pkcs7` uses `adbe.pkcs7.detached` instead. RSA, EC P-256 and EC P-384 keys are supported, as are both
 modern (AES) and legacy (3DES/RC2) PKCS#12 files.
 
-## Levels: time-stamp and revocation data
+## Levels: time-stamps and revocation data
 
 ```sh
 firma sign contract.pdf -u ana --level t     # PAdES B-T: with a time-stamp
 firma sign contract.pdf -u ana --level lt    # PAdES B-LT: time-stamp + revocation data
+firma sign contract.pdf -u ana --level lta   # PAdES B-LTA: B-LT + document time-stamp
 firma config --level lt                      # make it the default
 firma config --tsa http://timestamp.digicert.com
 ```
@@ -104,16 +110,32 @@ firma config --tsa http://timestamp.digicert.com
 | `b` (default) | Basic signature, no network access |
 | `t` | RFC 3161 time-stamp over the signature. The chain is completed through AIA and embedded in the signature |
 | `lt` | Everything in `t`, plus a `/DSS` dictionary with the full chain, OCSP responses and CRLs for the signer and the TSA |
+| `lta` | Everything in `lt`, plus a document time-stamp (`/DocTimeStamp`, `ETSI.RFC3161`) over the whole file, and the validation data for that time-stamp |
 
 - The default TSA is Izenpe's (`http://tsa.izenpe.com`). It is qualified, on the EU trusted list, and free to use.
   Change it with `--tsa`, `$FIRMA_TSA` or `firma config --tsa`.
+- TSAs that require HTTP Basic authentication: `--tsa-user` (or `firma config --tsa-user`). The password comes from
+  `$FIRMA_TSA_PASSWORD` or `--tsa-password-file`, or is prompted; it is never written to the config file.
+  Credentials are only sent to `https://` TSA URLs (set `FIRMA_ALLOW_INSECURE_AUTH=1` to override).
+  `--tsa-policy OID` (or `firma config --tsa-policy`) requests a specific TSA policy.
+- Every time-stamp token is checked before it is used. It must cover the requested data and nonce, its signed
+  attributes must be consistent, the signature must verify with the certificate in the token, and that
+  certificate must carry the time-stamping extended key usage. Whether the TSA itself is trusted (its chain
+  up to a root you trust) is decided by whoever validates the signed PDF, as with any signature.
 - With `lt`, if any certificate in the signer's chain is **revoked**, or its status cannot be obtained, signing
   is aborted and no file is written. Failures for the TSA's chain only print a warning.
 - OCSP from the certificate's AIA is tried first, then the CRL. Only http/https URLs are supported (no LDAP).
+- Revocation data is verified, not just downloaded. An OCSP response must be signed by the issuing CA or by a
+  delegated responder it issued (with the OCSPSigning EKU), match the certificate's full CertID, and be current.
+  A CRL must be signed by the issuer and not be expired. Intermediate certificates are only accepted if their
+  signature over the child certificate verifies.
+- URLs taken from certificates (AIA, OCSP, CRL) may not point to loopback, private, link-local or other non-public
+  addresses. This protects against SSRF, and the check also covers redirects and DNS rebinding. Set
+  `FIRMA_ALLOW_PRIVATE_NETWORK=1` for an internal corporate CA.
 - Honours `HTTPS_PROXY`/`HTTP_PROXY`. Preferences are stored in `config.toml` in the data directory.
 
 ## Limitations
 
-- No B-LTA (document time-stamp for long-term archival).
-- Encrypted PDFs cannot be signed.
-- TSAs that require authentication are not supported.
+- Revocation data is only fetched over http/https. LDAP CRL distribution points are skipped (most CAs
+  also publish an http one).
+- Certificate-based PDF encryption (public-key security handler) is not supported, only passwords.

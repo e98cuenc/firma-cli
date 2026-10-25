@@ -7,9 +7,10 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
-use super::write::{self, real, Body};
+use super::write::{real, Body};
+use super::source::Source;
 use super::{form_extent, page_box, page_rotation, resolve, text, Importer};
-use crate::cert::Credential;
+use crate::cert::{Credential, Digest};
 
 const MM: f64 = 72.0 / 25.4;
 const MARGIN_MM: f64 = 10.0;
@@ -174,7 +175,7 @@ impl Graphic {
 
 pub struct Signed {
     pub pdf: Vec<u8>,
-    /// Full /Contents value (CMS plus zero padding), used for the /VRI key.
+    /// Full /Contents value (CMS or time-stamp token plus zero padding), used for the /VRI key.
     pub contents: Vec<u8>,
 }
 
@@ -183,91 +184,169 @@ pub use crate::cms::Timestamper;
 /// A placed box: page, /Rect, page /Rotate and displayed size.
 type Located = (ObjectId, [f64; 4], i64, (f64, f64));
 
+/// Objects of one incremental update being assembled.
+struct Update<'s, 'a> {
+    src: &'s Source<'a>,
+    next_id: u32,
+    objects: Vec<(ObjectId, Body)>,
+}
+
+impl<'s, 'a> Update<'s, 'a> {
+    fn new(src: &'s Source<'a>) -> Result<Self> {
+        Ok(Self { src, next_id: src.first_free_id()?, objects: Vec::new() })
+    }
+
+    fn alloc(&mut self) -> ObjectId {
+        let id = (self.next_id, 0);
+        self.next_id += 1;
+        id
+    }
+
+    fn push(&mut self, id: ObjectId, obj: Object) {
+        self.objects.push((id, Body::Obj(obj)));
+    }
+
+    /// Adds the field's widgets to the pages' /Annots and the field to the /AcroForm.
+    fn add_field(&mut self, field_id: ObjectId, annots_by_page: &BTreeMap<ObjectId, Vec<ObjectId>>) -> Result<()> {
+        let doc = &self.src.doc;
+        for (page_id, new_annots) in annots_by_page {
+            let mut page = doc.get_dictionary(*page_id)?.clone();
+            let refs = new_annots.iter().map(|id| Object::Reference(*id));
+            match page.get(b"Annots").ok().cloned() {
+                Some(Object::Reference(arr_id)) => {
+                    let mut arr = doc.get_object(arr_id).and_then(Object::as_array).cloned().unwrap_or_default();
+                    arr.extend(refs);
+                    self.push(arr_id, Object::Array(arr));
+                }
+                Some(Object::Array(mut arr)) => {
+                    arr.extend(refs);
+                    page.set("Annots", arr);
+                    self.push(*page_id, Object::Dictionary(page));
+                }
+                _ => {
+                    page.set("Annots", refs.collect::<Vec<_>>());
+                    self.push(*page_id, Object::Dictionary(page));
+                }
+            }
+        }
+
+        let root_id = self.src.root_id()?;
+        let catalog = doc.get_dictionary(root_id)?.clone();
+        let (acroform_id, mut acroform) = match catalog.get(b"AcroForm") {
+            Ok(Object::Reference(id)) => (Some(*id), doc.get_dictionary(*id).cloned().unwrap_or_default()),
+            Ok(Object::Dictionary(d)) => (None, d.clone()),
+            _ => (None, Dictionary::new()),
+        };
+        let mut fields = acroform.get(b"Fields").map(|f| resolve(doc, f)).and_then(Object::as_array).cloned().unwrap_or_default();
+        fields.push(Object::Reference(field_id));
+        acroform.set("Fields", fields);
+        acroform.set("SigFlags", 3);
+        match acroform_id {
+            Some(id) => self.push(id, Object::Dictionary(acroform)),
+            None => {
+                let id = self.alloc();
+                self.push(id, Object::Dictionary(acroform));
+                let mut catalog = catalog;
+                catalog.set("AcroForm", id);
+                self.push(root_id, Object::Dictionary(catalog));
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the update. `head` is the signature dictionary up to (not including) /ByteRange;
+    /// /Contents is reserved with `reserve` bytes and filled with `produce(signed_bytes_digest_input)`,
+    /// which receives the two byte ranges covered by the signature.
+    fn finish(
+        mut self,
+        sig_id: ObjectId,
+        mut head: Vec<u8>,
+        reserve: usize,
+        produce: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>>,
+    ) -> Result<Signed> {
+        head.extend_from_slice(b"/ByteRange[0 0000000000 0000000000 0000000000]");
+        head.extend_from_slice(b"/Contents<");
+        head.extend(std::iter::repeat_n(b'0', reserve * 2));
+        head.extend_from_slice(b">>>");
+        self.objects.push((sig_id, Body::Raw(head)));
+
+        let written = self.src.write(self.objects)?;
+        let mut out = written.bytes;
+        let sig_off = written.offsets.iter().find(|(id, _)| *id == sig_id).map(|(_, o)| *o).unwrap();
+        let br_pos = sig_off + find(&out[sig_off..], b"/ByteRange[").unwrap() + b"/ByteRange[".len();
+        let contents_start = sig_off + find(&out[sig_off..], b"/Contents<").unwrap() + b"/Contents".len();
+        let contents_end = contents_start + reserve * 2 + 2;
+        let byte_range = format!("0 {:<10} {:<10} {:<10}", contents_start, contents_end, out.len() - contents_end);
+        debug_assert_eq!(byte_range.len(), "0 0000000000 0000000000 0000000000".len());
+        out[br_pos..br_pos + byte_range.len()].copy_from_slice(byte_range.as_bytes());
+
+        let value = produce(&out[..contents_start], &out[contents_end..])?;
+        if value.len() > reserve {
+            bail!("the signature takes {} bytes but only {} are reserved; use --reserve {}", value.len(), reserve, value.len() + 4096);
+        }
+        let hex: String = value.iter().map(|b| format!("{b:02X}")).collect();
+        out[contents_start + 1..contents_start + 1 + hex.len()].copy_from_slice(hex.as_bytes());
+        let mut contents = value;
+        contents.resize(reserve, 0);
+        Ok(Signed { pdf: out, contents })
+    }
+}
+
 pub fn sign_pdf(
     input: &[u8],
+    password: Option<&str>,
     cred: &Credential,
     graphic: Option<GraphicSource>,
     opts: &SignOptions,
     timestamp: Option<Timestamper>,
 ) -> Result<Signed> {
-    let doc = Document::load_mem(input).context("could not read the PDF")?;
-    if doc.trailer.get(b"Encrypt").is_ok() || doc.encryption_state.is_some() {
-        bail!("the PDF is encrypted; signing encrypted documents is not supported");
-    }
-    if doc.xref_start == 0 {
-        bail!("the PDF cross-reference table was not found");
-    }
-    let root_id = doc.trailer.get(b"Root").and_then(Object::as_reference).context("PDF without a catalog (/Root)")?;
+    let src = Source::open(input, password)?;
+    let doc = &src.doc;
+    let root_id = src.root_id()?;
     let pages = doc.get_pages();
     if pages.is_empty() {
         bail!("the PDF has no pages");
     }
-
-    let mut next_id = first_free_id(&doc)?;
-    let mut alloc = || {
-        let id = (next_id, 0);
-        next_id += 1;
-        id
-    };
-    let mut objects: Vec<(ObjectId, Body)> = Vec::new();
+    let mut up = Update::new(&src)?;
 
     // --- Visible boxes ---
     let mut widgets = Vec::new();
     let has_text = opts.stamp_text.is_some();
     for p in &opts.placements {
-        for (page, rect, rotate, size) in resolve_placement(&doc, &pages, p, DEFAULT_SIGNATURE_SIZE)? {
+        for (page, rect, rotate, size) in resolve_placement(doc, &pages, p, DEFAULT_SIGNATURE_SIZE)? {
             widgets.push(Widget { page, rect, rotate, size, with_graphic: graphic.is_some(), with_text: has_text });
         }
     }
     for p in &opts.stamp_placements {
-        for (page, rect, rotate, size) in resolve_placement(&doc, &pages, p, DEFAULT_STAMP_SIZE)? {
+        for (page, rect, rotate, size) in resolve_placement(doc, &pages, p, DEFAULT_STAMP_SIZE)? {
             widgets.push(Widget { page, rect, rotate, size, with_graphic: false, with_text: true });
         }
     }
 
     // --- Shared resources: font and signature graphic ---
     let font_id = if widgets.iter().any(|w| w.with_text) {
-        let id = alloc();
-        objects.push((
+        let id = up.alloc();
+        up.push(
             id,
-            Body::Obj(Object::Dictionary(dictionary! {
+            Object::Dictionary(dictionary! {
                 "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
-            })),
-        ));
+            }),
+        );
         Some(id)
     } else {
         None
     };
     let graphic = match (&graphic, widgets.iter().any(|w| w.with_graphic)) {
-        (Some(src), true) => Some(load_graphic(src, &mut next_id, &mut objects)?),
+        (Some(gs), true) => Some(load_graphic(gs, &mut up)?),
         _ => None,
-    };
-    let mut alloc = || {
-        let id = (next_id, 0);
-        next_id += 1;
-        id
     };
 
     // --- Appearances and annotations ---
-    let sig_id = alloc();
-    let field_id = alloc();
-    let field_name = unique_field_name(&doc, root_id);
+    let sig_id = up.alloc();
+    let field_id = up.alloc();
+    let field_name = unique_field_name(doc, root_id);
     let mut widget_ids = Vec::new();
     let mut annots_by_page: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-
-    let make_widget = |rect: [f64; 4], page: ObjectId, ap: Option<ObjectId>| {
-        let mut d = dictionary! {
-            "Type" => "Annot",
-            "Subtype" => "Widget",
-            "Rect" => rect.iter().map(|v| Object::Real(*v as f32)).collect::<Vec<_>>(),
-            "P" => page,
-            "F" => 132, // print + locked
-        };
-        if let Some(ap) = ap {
-            d.set("AP", dictionary! { "N" => ap });
-        }
-        d
-    };
     let field_entries = |d: &mut Dictionary| {
         d.set("FT", "Sig");
         d.set("T", Object::String(text_string(&field_name), StringFormat::Hexadecimal));
@@ -279,11 +358,11 @@ pub fn sign_pdf(
         let first = *pages.values().next().unwrap();
         let mut d = make_widget([0.0; 4], first, None);
         field_entries(&mut d);
-        objects.push((field_id, Body::Obj(Object::Dictionary(d))));
+        up.push(field_id, Object::Dictionary(d));
         annots_by_page.entry(first).or_default().push(field_id);
     } else {
         for w in &widgets {
-            let ap_id = alloc();
+            let ap_id = up.alloc();
             let (bw, bh) = w.size;
             let ap = appearance(
                 bw,
@@ -293,15 +372,15 @@ pub fn sign_pdf(
                 if w.with_text { opts.stamp_text.as_deref() } else { None },
                 font_id,
             );
-            objects.push((ap_id, Body::Obj(ap)));
-            let widget_id = if widgets.len() == 1 { field_id } else { alloc() };
+            up.push(ap_id, ap);
+            let widget_id = if widgets.len() == 1 { field_id } else { up.alloc() };
             let mut d = make_widget(w.rect, w.page, Some(ap_id));
             if widgets.len() == 1 {
                 field_entries(&mut d);
             } else {
                 d.set("Parent", field_id);
             }
-            objects.push((widget_id, Body::Obj(Object::Dictionary(d))));
+            up.push(widget_id, Object::Dictionary(d));
             widget_ids.push(widget_id);
             annots_by_page.entry(w.page).or_default().push(widget_id);
         }
@@ -309,157 +388,100 @@ pub fn sign_pdf(
             let mut d = Dictionary::new();
             field_entries(&mut d);
             d.set("Kids", widget_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
-            objects.push((field_id, Body::Obj(Object::Dictionary(d))));
+            up.push(field_id, Object::Dictionary(d));
         }
     }
+    up.add_field(field_id, &annots_by_page)?;
 
-    // --- Pages: add the widgets to /Annots ---
-    for (page_id, new_annots) in &annots_by_page {
-        let mut page = doc.get_dictionary(*page_id)?.clone();
-        let refs = new_annots.iter().map(|id| Object::Reference(*id));
-        match page.get(b"Annots").ok().cloned() {
-            Some(Object::Reference(arr_id)) => {
-                let mut arr = doc.get_object(arr_id).and_then(Object::as_array).cloned().unwrap_or_default();
-                arr.extend(refs);
-                objects.push((arr_id, Body::Obj(Object::Array(arr))));
-            }
-            Some(Object::Array(mut arr)) => {
-                arr.extend(refs);
-                page.set("Annots", arr);
-                objects.push((*page_id, Body::Obj(Object::Dictionary(page))));
-            }
-            _ => {
-                page.set("Annots", refs.collect::<Vec<_>>());
-                objects.push((*page_id, Body::Obj(Object::Dictionary(page))));
-            }
-        }
-    }
-
-    // --- Form (AcroForm) ---
-    let catalog = doc.get_dictionary(root_id)?.clone();
-    let (acroform_id, mut acroform) = match catalog.get(b"AcroForm") {
-        Ok(Object::Reference(id)) => (Some(*id), doc.get_dictionary(*id).cloned().unwrap_or_default()),
-        Ok(Object::Dictionary(d)) => (None, d.clone()),
-        _ => (None, Dictionary::new()),
-    };
-    let mut fields = acroform
-        .get(b"Fields")
-        .map(|f| resolve(&doc, f))
-        .and_then(Object::as_array)
-        .cloned()
-        .unwrap_or_default();
-    fields.push(Object::Reference(field_id));
-    acroform.set("Fields", fields);
-    acroform.set("SigFlags", 3);
-    match acroform_id {
-        Some(id) => objects.push((id, Body::Obj(Object::Dictionary(acroform)))),
-        None => {
-            let id = alloc();
-            objects.push((id, Body::Obj(Object::Dictionary(acroform))));
-            let mut catalog = catalog;
-            catalog.set("AcroForm", id);
-            objects.push((root_id, Body::Obj(Object::Dictionary(catalog))));
-        }
-    }
-
-    // --- Signature dictionary with placeholders for /ByteRange and /Contents ---
+    // --- Signature dictionary (strings encrypted if the PDF is) ---
     let info = cred.info();
-    let mut sig = Vec::new();
-    sig.extend_from_slice(b"<</Type/Sig/Filter/Adobe.PPKLite/SubFilter");
-    sig.extend_from_slice(match opts.subfilter {
+    let mut head = Vec::new();
+    head.extend_from_slice(b"<</Type/Sig/Filter/Adobe.PPKLite/SubFilter");
+    head.extend_from_slice(match opts.subfilter {
         SubFilter::Pades => b"/ETSI.CAdES.detached",
         SubFilter::Pkcs7 => b"/adbe.pkcs7.detached",
     });
-    let _ = write!(sig, "/M{}", pdf_date(&opts.date));
-    let mut text_entry = |key: &str, value: &str| {
-        let mut o = Vec::new();
-        write::object(&mut o, &Object::String(text_string(value), StringFormat::Hexadecimal));
-        let _ = write!(sig, "/{key}");
-        sig.extend(o);
-    };
-    text_entry("Name", &info.holder);
-    if let Some(r) = &opts.reason {
-        text_entry("Reason", r);
+    head.extend_from_slice(b"/M");
+    head.extend(src.string(sig_id, pdf_date(&opts.date).into_bytes())?);
+    let mut entries = vec![("Name", info.holder.clone())];
+    entries.extend(opts.reason.clone().map(|r| ("Reason", r)));
+    entries.extend(opts.location.clone().map(|l| ("Location", l)));
+    entries.extend(opts.contact.clone().map(|c| ("ContactInfo", c)));
+    for (key, value) in entries {
+        let _ = write!(head, "/{key}");
+        head.extend(src.string(sig_id, text_string(&value))?);
     }
-    if let Some(l) = &opts.location {
-        text_entry("Location", l);
-    }
-    if let Some(c) = &opts.contact {
-        text_entry("ContactInfo", c);
-    }
-    let _ = write!(sig, "/Prop_Build<</App<</Name/firma/REx({})>>>>", env!("CARGO_PKG_VERSION"));
-    sig.extend_from_slice(b"/ByteRange[0 0000000000 0000000000 0000000000]");
-    sig.extend_from_slice(b"/Contents<");
-    sig.extend(std::iter::repeat_n(b'0', opts.reserve * 2));
-    sig.extend_from_slice(b">>>");
-    objects.push((sig_id, Body::Raw(sig)));
+    head.extend_from_slice(b"/Prop_Build<</App<</Name/firma/REx");
+    head.extend(src.string(sig_id, env!("CARGO_PKG_VERSION").as_bytes().to_vec())?);
+    head.extend_from_slice(b">>>>");
 
-    // --- Write and sign ---
-    let written = write::incremental(input, doc.xref_start, &doc.trailer, objects);
-    let mut out = written.bytes;
-    let sig_off = written.offsets.iter().find(|(id, _)| *id == sig_id).map(|(_, o)| *o).unwrap();
-    let br_pos = sig_off + find(&out[sig_off..], b"/ByteRange[").unwrap() + b"/ByteRange[".len();
-    let contents_start = sig_off + find(&out[sig_off..], b"/Contents<").unwrap() + b"/Contents".len();
-    let contents_end = contents_start + opts.reserve * 2 + 2;
-    let byte_range = format!(
-        "0 {:<10} {:<10} {:<10}",
-        contents_start,
-        contents_end,
-        out.len() - contents_end
-    );
-    debug_assert_eq!(byte_range.len(), "0 0000000000 0000000000 0000000000".len());
-    out[br_pos..br_pos + byte_range.len()].copy_from_slice(byte_range.as_bytes());
+    up.finish(sig_id, head, opts.reserve, |before, after| {
+        let digest = cred.digest().hash(&[before, after]);
+        crate::cms::sign_detached(cred, &digest, timestamp)
+    })
+}
 
-    let digest = cred.digest().hash(&[&out[..contents_start], &out[contents_end..]]);
-    let cms = crate::cms::sign_detached(cred, &digest, timestamp)?;
-    if cms.len() > opts.reserve {
-        bail!("the signature takes {} bytes but only {} are reserved; use --reserve {}", cms.len(), opts.reserve, cms.len() + 4096);
-    }
-    let hex: String = cms.iter().map(|b| format!("{b:02X}")).collect();
-    out[contents_start + 1..contents_start + 1 + hex.len()].copy_from_slice(hex.as_bytes());
-    let mut contents = cms;
-    contents.resize(opts.reserve, 0);
-    Ok(Signed { pdf: out, contents })
+/// Adds a document time-stamp (PAdES B-LTA): an invisible signature field whose /Contents is an
+/// RFC 3161 token over the whole document. `stamp` receives the SHA-256 digest of the covered bytes.
+pub fn add_doc_timestamp(
+    input: &[u8],
+    password: Option<&str>,
+    reserve: usize,
+    stamp: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+) -> Result<Signed> {
+    let src = Source::open(input, password)?;
+    let pages = src.doc.get_pages();
+    let first = *pages.values().next().context("the PDF has no pages")?;
+    let mut up = Update::new(&src)?;
+    let ts_id = up.alloc();
+    let field_id = up.alloc();
+    let mut d = make_widget([0.0; 4], first, None);
+    d.set("FT", "Sig");
+    let name = unique_field_name(&src.doc, src.root_id()?).replace("Signature", "DocTimeStamp");
+    d.set("T", Object::String(text_string(&name), StringFormat::Hexadecimal));
+    d.set("V", ts_id);
+    up.push(field_id, Object::Dictionary(d));
+    up.add_field(field_id, &BTreeMap::from([(first, vec![field_id])]))?;
+    let head = b"<</Type/DocTimeStamp/Filter/Adobe.PPKLite/SubFilter/ETSI.RFC3161".to_vec();
+    up.finish(ts_id, head, reserve, |before, after| stamp(&Digest::Sha256.hash(&[before, after])))
 }
 
 /// Adds (or extends) the /DSS dictionary in a new incremental update (PAdES B-LT).
-pub fn append_dss(pdf: &[u8], contents: &[u8], v: &crate::revocation::Validation) -> Result<Vec<u8>> {
+pub fn append_dss(pdf: &[u8], password: Option<&str>, contents: &[u8], v: &crate::revocation::Validation) -> Result<Vec<u8>> {
     use sha1::Digest as _;
-    let doc = Document::load_mem(pdf).context("could not re-read the signed PDF")?;
-    let root_id = doc.trailer.get(b"Root").and_then(Object::as_reference)?;
-    let mut next_id = first_free_id(&doc)?;
-    let mut objects: Vec<(ObjectId, Body)> = Vec::new();
-    let mut add_streams = |items: &[Vec<u8>], objects: &mut Vec<(ObjectId, Body)>| -> Vec<Object> {
+    let src = Source::open(pdf, password).context("could not re-read the signed PDF")?;
+    let doc = &src.doc;
+    let root_id = src.root_id()?;
+    let mut up = Update::new(&src)?;
+    let mut add_streams = |items: &[Vec<u8>]| -> Vec<Object> {
         items
             .iter()
             .map(|data| {
-                let id = (next_id, 0);
-                next_id += 1;
-                let s = Stream::new(dictionary! { "Filter" => "FlateDecode" }, deflate(data));
-                objects.push((id, Body::Obj(Object::Stream(s))));
+                let id = up.alloc();
+                up.push(id, Object::Stream(Stream::new(dictionary! { "Filter" => "FlateDecode" }, deflate(data))));
                 Object::Reference(id)
             })
             .collect()
     };
-    let certs = add_streams(&v.certs, &mut objects);
-    let ocsps = add_streams(&v.ocsps, &mut objects);
-    let crls = add_streams(&v.crls, &mut objects);
+    let certs = add_streams(&v.certs);
+    let ocsps = add_streams(&v.ocsps);
+    let crls = add_streams(&v.crls);
 
     let mut catalog = doc.get_dictionary(root_id)?.clone();
     let (dss_id, mut dss) = match catalog.get(b"DSS") {
         Ok(Object::Reference(id)) => (*id, doc.get_dictionary(*id).cloned().unwrap_or_default()),
-        Ok(Object::Dictionary(d)) => ((next_id, 0), d.clone()),
-        _ => ((next_id, 0), Dictionary::new()),
+        Ok(Object::Dictionary(d)) => (up.alloc(), d.clone()),
+        _ => (up.alloc(), Dictionary::new()),
     };
-    if dss_id.0 == next_id {
+    if !matches!(catalog.get(b"DSS"), Ok(Object::Reference(_))) {
         catalog.set("DSS", dss_id);
-        objects.push((root_id, Body::Obj(Object::Dictionary(catalog))));
+        up.push(root_id, Object::Dictionary(catalog));
     }
     let merge = |dss: &mut Dictionary, key: &str, new: &[Object]| {
         if new.is_empty() {
             return;
         }
-        let mut arr = dss.get(key.as_bytes()).map(|o| resolve(&doc, o)).and_then(Object::as_array).cloned().unwrap_or_default();
+        let mut arr = dss.get(key.as_bytes()).map(|o| resolve(doc, o)).and_then(Object::as_array).cloned().unwrap_or_default();
         arr.extend_from_slice(new);
         dss.set(key, arr);
     };
@@ -475,25 +497,27 @@ pub fn append_dss(pdf: &[u8], contents: &[u8], v: &crate::revocation::Validation
             entry.set(k, arr.clone());
         }
     }
-    let mut vri = dss.get(b"VRI").map(|o| resolve(&doc, o)).and_then(Object::as_dict).cloned().unwrap_or_default();
+    let mut vri = dss.get(b"VRI").map(|o| resolve(doc, o)).and_then(Object::as_dict).cloned().unwrap_or_default();
     vri.set(key.as_bytes().to_vec(), entry);
     dss.set("VRI", vri);
     dss.set("Type", "DSS");
-    objects.push((dss_id, Body::Obj(Object::Dictionary(dss))));
+    up.push(dss_id, Object::Dictionary(dss));
 
-    Ok(write::incremental(pdf, doc.xref_start, &doc.trailer, objects).bytes)
+    Ok(src.write(up.objects)?.bytes)
 }
 
-/// First object number not used by the document: max(max_id + 1, /Size), validated so that a
-/// crafted trailer cannot make new objects overwrite existing ones.
-fn first_free_id(doc: &Document) -> Result<u32> {
-    let size = doc.trailer.get(b"Size").and_then(Object::as_i64).unwrap_or(0).max(0);
-    let next = (doc.max_id as i64 + 1).max(size);
-    // ISO 32000 limits object numbers to 8,388,607; leave room for the objects we add.
-    if next > 8_000_000 {
-        bail!("the PDF has too many objects (or an invalid /Size)");
+fn make_widget(rect: [f64; 4], page: ObjectId, ap: Option<ObjectId>) -> Dictionary {
+    let mut d = dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "Rect" => rect.iter().map(|v| Object::Real(*v as f32)).collect::<Vec<_>>(),
+        "P" => page,
+        "F" => 132, // print + locked
+    };
+    if let Some(ap) = ap {
+        d.set("AP", dictionary! { "N" => ap });
     }
-    Ok(next as u32)
+    d
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -630,8 +654,8 @@ fn appearance(w: f64, h: f64, rotate: i64, graphic: Option<&Graphic>, text: Opti
     Object::Stream(Stream::new(dict, content))
 }
 
-fn load_graphic(src: &GraphicSource, next_id: &mut u32, objects: &mut Vec<(ObjectId, Body)>) -> Result<Graphic> {
-    match src {
+fn load_graphic(gs: &GraphicSource, up: &mut Update) -> Result<Graphic> {
+    match gs {
         GraphicSource::Image(path) => {
             let img = image::open(path).with_context(|| format!("could not open {}", path.display()))?.to_rgba8();
             let (w, h) = img.dimensions();
@@ -647,19 +671,17 @@ fn load_graphic(src: &GraphicSource, next_id: &mut u32, objects: &mut Vec<(Objec
                 "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "FlateDecode",
             };
             if alpha.iter().any(|a| *a != 255) {
-                let smask_id = (*next_id, 0);
-                *next_id += 1;
+                let smask_id = up.alloc();
                 let smask = dictionary! {
                     "Type" => "XObject", "Subtype" => "Image",
                     "Width" => w as i64, "Height" => h as i64,
                     "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => "FlateDecode",
                 };
-                objects.push((smask_id, Body::Obj(Object::Stream(Stream::new(smask, deflate(&alpha))))));
+                up.push(smask_id, Object::Stream(Stream::new(smask, deflate(&alpha))));
                 dict.set("SMask", smask_id);
             }
-            let id = (*next_id, 0);
-            *next_id += 1;
-            objects.push((id, Body::Obj(Object::Stream(Stream::new(dict, deflate(&rgb))))));
+            let id = up.alloc();
+            up.push(id, Object::Stream(Stream::new(dict, deflate(&rgb))));
             Ok(Graphic::Image { id, w: w as f64, h: h as f64 })
         }
         GraphicSource::Vector(path) => {
@@ -669,9 +691,11 @@ fn load_graphic(src: &GraphicSource, next_id: &mut u32, objects: &mut Vec<(Objec
             let form_ref = resolve(&src, res.get(b"XObject")?).as_dict()?.get(b"Signature")?.as_reference()?;
             let form = src.get_object(form_ref)?.as_stream()?;
             let extent = form_extent(&src, &form.dict).context("the vector signature has no valid /BBox")?;
-            let mut imp = Importer::new(&src, next_id);
+            let mut imp = Importer::new(&src, &mut up.next_id);
             let id = imp.import_ref(form_ref);
-            objects.extend(imp.out.into_iter().map(|(id, o)| (id, Body::Obj(o))));
+            for (oid, o) in imp.out {
+                up.push(oid, o);
+            }
             Ok(Graphic::Form { id, extent })
         }
     }
@@ -717,5 +741,5 @@ fn pdf_date(d: &chrono::DateTime<chrono::Local>) -> String {
     let off = d.offset().local_minus_utc();
     let sign = if off < 0 { '-' } else { '+' };
     let off = off.abs();
-    format!("({}{}{:02}'{:02}')", d.format("D:%Y%m%d%H%M%S"), sign, off / 3600, (off % 3600) / 60)
+    format!("{}{}{:02}'{:02}'", d.format("D:%Y%m%d%H%M%S"), sign, off / 3600, (off % 3600) / 60)
 }

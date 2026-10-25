@@ -30,12 +30,18 @@ pub struct UserMeta {
 /// Global preferences (`config.toml` in the data directory).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    /// Default PAdES level: "b", "t" or "lt".
+    /// Default PAdES level: "b", "t", "lt" or "lta".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
     /// Time-stamping authority URL (RFC 3161).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tsa: Option<String>,
+    /// User for TSAs that require HTTP authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsa_user: Option<String>,
+    /// TSA policy OID to request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsa_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

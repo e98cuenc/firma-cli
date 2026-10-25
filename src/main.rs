@@ -6,6 +6,7 @@ mod preview;
 mod revocation;
 mod store;
 mod tsa;
+mod verify;
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -39,7 +40,7 @@ enum Cmd {
     #[command(subcommand)]
     User(UserCmd),
     /// Sign a PDF
-    Sign(SignArgs),
+    Sign(Box<SignArgs>),
     /// Show or change preferences (default PAdES level and TSA)
     Config {
         /// Default PAdES level
@@ -48,6 +49,13 @@ enum Cmd {
         /// Default TSA (RFC 3161 URL)
         #[arg(long)]
         tsa: Option<String>,
+        /// User for TSAs that require authentication (its password goes in $FIRMA_TSA_PASSWORD
+        /// or --tsa-password-file, never in the config file)
+        #[arg(long)]
+        tsa_user: Option<String>,
+        /// TSA policy OID to request
+        #[arg(long)]
+        tsa_policy: Option<String>,
     },
 }
 
@@ -60,11 +68,13 @@ enum Level {
     T,
     /// B-LT: time-stamp plus embedded revocation data (OCSP/CRL)
     Lt,
+    /// B-LTA: B-LT plus a document time-stamp for long-term archival
+    Lta,
 }
 
 impl Level {
     fn parse(s: &str) -> Result<Self> {
-        Level::from_str(s, true).map_err(|_| anyhow::anyhow!("invalid level '{s}' (b, t or lt)"))
+        Level::from_str(s, true).map_err(|_| anyhow::anyhow!("invalid level '{s}' (b, t, lt or lta)"))
     }
 
     fn name(self) -> &'static str {
@@ -72,6 +82,7 @@ impl Level {
             Level::B => "PAdES B-B",
             Level::T => "PAdES B-T",
             Level::Lt => "PAdES B-LT",
+            Level::Lta => "PAdES B-LTA",
         }
     }
 }
@@ -180,12 +191,25 @@ struct SignArgs {
     /// Use adbe.pkcs7.detached instead of PAdES (ETSI.CAdES.detached)
     #[arg(long)]
     pkcs7: bool,
-    /// PAdES level: b, t (time-stamp) or lt (time-stamp + revocation). Default: from `firma config`, or b
+    /// PAdES level: b, t (time-stamp), lt (+ revocation data) or lta (+ document time-stamp).
+    /// Default: from `firma config`, or b
     #[arg(long, value_enum)]
     level: Option<Level>,
     /// Time-stamping authority (RFC 3161 URL); default: from `firma config`, $FIRMA_TSA, or Izenpe
     #[arg(long, value_name = "URL")]
     tsa: Option<String>,
+    /// User for a TSA that requires HTTP authentication (default: from `firma config`)
+    #[arg(long, value_name = "USER")]
+    tsa_user: Option<String>,
+    /// File with the TSA password (otherwise $FIRMA_TSA_PASSWORD, or it is prompted)
+    #[arg(long, value_name = "FILE")]
+    tsa_password_file: Option<PathBuf>,
+    /// TSA policy OID to request (default: from `firma config`)
+    #[arg(long, value_name = "OID")]
+    tsa_policy: Option<String>,
+    /// File with the password of an encrypted PDF (otherwise $FIRMA_PDF_PASSWORD, or it is prompted)
+    #[arg(long, value_name = "FILE")]
+    pdf_password_file: Option<PathBuf>,
     /// Bytes reserved for the CMS signature (default 16384, or 65536 with a time-stamp)
     #[arg(long)]
     reserve: Option<usize>,
@@ -208,15 +232,28 @@ fn run() -> Result<()> {
     let store = Store::open(cli.home)?;
     match cli.cmd {
         Cmd::User(c) => user_cmd(&store, c),
-        Cmd::Sign(a) => sign_cmd(&store, a),
-        Cmd::Config { level, tsa } => {
+        Cmd::Sign(a) => sign_cmd(&store, *a),
+        Cmd::Config { level, tsa, tsa_user, tsa_policy } => {
             let mut config = store.config()?;
-            if level.is_none() && tsa.is_none() {
+            if level.is_none() && tsa.is_none() && tsa_user.is_none() && tsa_policy.is_none() {
                 println!("{}", store.config_path().display());
-                println!("  level: {}", config.level.as_deref().unwrap_or("b"));
-                println!("  tsa:   {}", config.tsa.as_deref().unwrap_or(DEFAULT_TSA));
+                println!("  level:      {}", config.level.as_deref().unwrap_or("b"));
+                println!("  tsa:        {}", config.tsa.as_deref().unwrap_or(DEFAULT_TSA));
+                println!("  tsa-user:   {}", config.tsa_user.as_deref().unwrap_or("(none)"));
+                println!("  tsa-policy: {}", config.tsa_policy.as_deref().unwrap_or("(none)"));
                 return Ok(());
             }
+            if let Some(p) = &tsa_policy {
+                p.parse::<der::asn1::ObjectIdentifier>().map_err(|_| anyhow::anyhow!("invalid OID '{p}'"))?;
+            }
+            // An empty value clears the setting.
+            let set = |v: Option<String>, slot: &mut Option<String>| {
+                if let Some(v) = v {
+                    *slot = (!v.is_empty()).then_some(v);
+                }
+            };
+            set(tsa_user, &mut config.tsa_user);
+            set(tsa_policy, &mut config.tsa_policy);
             if let Some(l) = level {
                 config.level = Some(format!("{l:?}").to_lowercase());
             }
@@ -410,6 +447,13 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         bail!("{} already exists (use --force to overwrite it)", output.display());
     }
 
+    let pdf_password = match pdf_password(&a.pdf_password_file)? {
+        Some(p) => Some(p),
+        None if pdf::source::Source::needs_password(&input) => Some(rpassword::prompt_password("PDF password: ")?),
+        None => None,
+    };
+    let pdf_password = pdf_password.as_deref();
+
     let p12 = fs::read(user.cert_path()).context("the user has no certificate")?;
     let password = read_password(&a.password, &format!("Certificate password for '{}': ", a.user))?;
     let mut cred = Credential::load(&p12, &password)?;
@@ -438,12 +482,7 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         (None, Some(l)) => Level::parse(l)?,
         (None, None) => Level::B,
     };
-    let tsa_url = a
-        .tsa
-        .clone()
-        .or(config.tsa.clone())
-        .or_else(|| std::env::var("FIRMA_TSA").ok())
-        .unwrap_or_else(|| DEFAULT_TSA.to_string());
+    let tsa = if level >= Level::T { Some(tsa_settings(&a, &config)?) } else { None };
 
     let date = chrono::Local::now();
     let stamp_text = stamp.then(|| {
@@ -476,7 +515,7 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         SignatureKind::Vector => GraphicSource::Vector(p),
     });
 
-    // With network access (B-T, B-LT) the chain is completed through AIA and embedded in the
+    // With network access (B-T and up) the chain is completed through AIA and embedded in the
     // signature: many .p12 files only contain the end-entity certificate.
     if level >= Level::T {
         let chain = revocation::build_chain(&cred.cert_der, &cred.chain_der)?;
@@ -487,16 +526,17 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         }
     }
 
-    // Time-stamp (B-T and B-LT): requested over the signature value.
+    // Signature time-stamp (B-T and up): requested over the signature value.
     let tsa_token: std::cell::RefCell<Option<tsa::Token>> = Default::default();
     let timestamp = |signature: &[u8]| -> Result<Vec<u8>> {
-        let token = tsa::request(&tsa_url, signature).with_context(|| format!("time-stamp from {tsa_url}"))?;
+        let tsa = tsa.as_ref().unwrap();
+        let token = tsa.stamp(signature).with_context(|| format!("time-stamp from {}", tsa.url))?;
         let der = token.der.clone();
         *tsa_token.borrow_mut() = Some(token);
         Ok(der)
     };
-    let timestamper: Option<pdf::sign::Timestamper> = (level >= Level::T).then_some(&timestamp);
-    let signed = pdf::sign::sign_pdf(&input, &cred, graphic, &opts, timestamper)?;
+    let timestamper: Option<pdf::sign::Timestamper> = tsa.is_some().then_some(&timestamp);
+    let signed = pdf::sign::sign_pdf(&input, pdf_password, &cred, graphic, &opts, timestamper)?;
     let mut out = signed.pdf;
     let token = tsa_token.into_inner();
 
@@ -504,7 +544,7 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     if let Some(t) = &token {
         details.push(format!("time-stamp {}", t.time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")));
     }
-    if level == Level::Lt {
+    if level >= Level::Lt {
         // If any certificate in the chain is revoked, abort without writing anything.
         let mut v = revocation::Validation::default();
         let mut pool = cred.chain_der.clone();
@@ -512,11 +552,31 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
             pool.extend(t.certs.iter().cloned());
         }
         revocation::collect(&mut v, &cred.cert_der, &pool, true)?;
-        if let Some(signer) = token.as_ref().and_then(|t| t.signer.as_ref()) {
-            revocation::collect(&mut v, signer, &pool, false)?;
+        if let Some(t) = &token {
+            revocation::collect(&mut v, &t.signer, &pool, false)?;
         }
         details.push(format!("{} certificates, {} OCSP, {} CRL", v.certs.len(), v.ocsps.len(), v.crls.len()));
-        out = pdf::sign::append_dss(&out, &signed.contents, &v)?;
+        out = pdf::sign::append_dss(&out, pdf_password, &signed.contents, &v)?;
+    }
+    if level == Level::Lta {
+        // Document time-stamp over everything so far, then its own validation data so that the
+        // archive time-stamp can be validated later too.
+        let tsa = tsa.as_ref().unwrap();
+        let doc_token: std::cell::RefCell<Option<tsa::Token>> = Default::default();
+        let ts = pdf::sign::add_doc_timestamp(&out, pdf_password, 32768, |digest| {
+            let token = tsa
+                .stamp_digest(cert::Digest::Sha256, digest)
+                .with_context(|| format!("document time-stamp from {}", tsa.url))?;
+            let der = token.der.clone();
+            *doc_token.borrow_mut() = Some(token);
+            Ok(der)
+        })?;
+        out = ts.pdf;
+        let token = doc_token.into_inner().expect("document time-stamp");
+        let mut v = revocation::Validation::default();
+        revocation::collect(&mut v, &token.signer, &token.certs, false)?;
+        out = pdf::sign::append_dss(&out, pdf_password, &ts.contents, &v)?;
+        details.push(format!("document time-stamp {}", token.time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")));
     }
 
     fs::write(&output, out).with_context(|| format!("writing {}", output.display()))?;
@@ -525,10 +585,47 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     Ok(())
 }
 
+fn tsa_settings(a: &SignArgs, config: &Config) -> Result<tsa::Tsa> {
+    let url = a
+        .tsa
+        .clone()
+        .or(config.tsa.clone())
+        .or_else(|| std::env::var("FIRMA_TSA").ok())
+        .unwrap_or_else(|| DEFAULT_TSA.to_string());
+    let user = a.tsa_user.clone().or(config.tsa_user.clone());
+    if user.is_some() && url == DEFAULT_TSA {
+        bail!("a TSA user is configured but no TSA URL: set one with --tsa or `firma config --tsa`");
+    }
+    let password = match (&user, &a.tsa_password_file) {
+        (_, Some(f)) => Some(read_secret_file(f)?),
+        (Some(u), None) => Some(match std::env::var("FIRMA_TSA_PASSWORD") {
+            Ok(p) => p,
+            Err(_) => rpassword::prompt_password(format!("TSA password for {u}: "))?,
+        }),
+        (None, None) => None,
+    };
+    let policy = match a.tsa_policy.clone().or(config.tsa_policy.clone()) {
+        Some(p) => Some(p.parse().map_err(|_| anyhow::anyhow!("invalid TSA policy OID '{p}'"))?),
+        None => None,
+    };
+    Ok(tsa::Tsa { url, user, password, policy })
+}
+
+fn pdf_password(file: &Option<PathBuf>) -> Result<Option<String>> {
+    if let Some(f) = file {
+        return Ok(Some(read_secret_file(f)?));
+    }
+    Ok(std::env::var("FIRMA_PDF_PASSWORD").ok())
+}
+
+fn read_secret_file(f: &Path) -> Result<String> {
+    let s = fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+    Ok(s.trim_end_matches(['\r', '\n']).to_string())
+}
+
 fn read_password(args: &PasswordArgs, prompt: &str) -> Result<String> {
     if let Some(f) = &args.password_file {
-        let s = fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
-        return Ok(s.trim_end_matches(['\r', '\n']).to_string());
+        return read_secret_file(f);
     }
     if let Ok(p) = std::env::var("FIRMA_PASSWORD") {
         return Ok(p);
