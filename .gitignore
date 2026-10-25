@@ -1,0 +1,6 @@
+/target
+/dist
+# never commit certificates or keys
+*.p12
+*.pfx
+*.key
