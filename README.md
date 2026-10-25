@@ -12,6 +12,24 @@ A single self-contained binary written in pure Rust: no Java, no OpenSSL, no ext
 - Signs encrypted PDFs (RC4, AES-128, AES-256), respecting their permissions.
 - Imports the signature you saved in macOS Preview, as vector graphics.
 
+## Agent skill (Claude, Codex, …)
+
+The repo also ships `sign-pdf`, an [Agent Skill](https://agentskills.io) that lets an AI agent sign documents
+with `firma` on your behalf. It finds or installs the binary, checks the request with `firma sign --dry-run`,
+shows you a summary and asks for confirmation before signing. It never handles your passwords: you run the
+final command yourself, or point it to a password file only you can read.
+
+| Agent | Install |
+|---|---|
+| Claude Code | `/plugin install firma --marketplace e98cuenc/firma-cli` |
+| Claude.ai / Claude Desktop | Download `sign-pdf-skill.zip` from the releases and upload it in Customize > Skills (it bundles the binaries, so it also works in sandboxes without network access) |
+| Codex and other Agent Skills readers | Unzip `sign-pdf-skill.zip` into `~/.agents/skills/` |
+| Any of the above, from a checkout | `scripts/install-skill.sh` (copies it to `~/.claude/skills` and `~/.agents/skills`) |
+
+The skill's source is in `plugins/firma/skills/sign-pdf`. CI builds `sign-pdf-skill.zip` with the binaries for every
+platform, smoke-tests the bundled Linux binary, and attaches the zip to each release.
+`scripts/build-skill.sh` builds the zip locally.
+
 ## Install
 
 Download the archive for your platform from the [releases](../../releases) page and put `firma`
@@ -25,9 +43,12 @@ cargo install --locked --path .        # installs into ~/.cargo/bin
 
 | Platform | Release artifact | Notes |
 |---|---|---|
-| macOS | `firma-<version>-macos-universal.tar.gz` | Universal binary (Apple Silicon + Intel) |
-| Linux | `firma-<version>-x86_64-linux.tar.gz`, `…-aarch64-linux.tar.gz` | Fully static (musl) |
-| Windows | `firma-<version>-x86_64-windows.zip` | Static CRT, no Visual C++ runtime needed |
+| macOS | `firma-macos-universal.tar.gz` | Universal binary (Apple Silicon + Intel) |
+| Linux | `firma-x86_64-linux.tar.gz`, `firma-aarch64-linux.tar.gz` | Fully static (musl) |
+| Windows | `firma-x86_64-windows.zip` | Static CRT, no Visual C++ runtime needed |
+
+Or use the installers, which check the release's SHA-256 sums:
+`plugins/firma/skills/sign-pdf/scripts/install.sh` (macOS/Linux, into `~/.local/bin`) or `install.ps1` (Windows).
 
 Release builds are produced by GitHub Actions (`.github/workflows/build.yml`) when a `v*` tag is pushed:
 
@@ -86,6 +107,8 @@ firma sign contract.pdf -u ana --at 1:120,40:70x30 --stamp-at 1:top-right \
   `\n` inserts a line break. For example, an AutoFirma-like Spanish stamp:
   `--text 'Firmado por {name} el {date} con un certificado emitido por {issuer}'`.
 - The password is prompted in the terminal. It can also come from `$FIRMA_PASSWORD` or `--password-file`.
+- `--dry-run` validates everything (user, pages, positions, level) and prints what would be signed, without
+  asking for any password or writing anything.
 - Encrypted PDFs are supported. The new objects are encrypted with the document's own key, and the document's
   permissions are respected (adding annotations must be allowed). If the PDF needs a password to open, it is
   prompted, or read from `$FIRMA_PDF_PASSWORD` or `--pdf-password-file`.

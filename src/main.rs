@@ -216,6 +216,9 @@ struct SignArgs {
     /// Overwrite the output if it already exists
     #[arg(long, short = 'f')]
     force: bool,
+    /// Check everything and print what would be signed, without signing (no password needed)
+    #[arg(long)]
+    dry_run: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -447,9 +450,13 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         bail!("{} already exists (use --force to overwrite it)", output.display());
     }
 
+    if a.dry_run {
+        return dry_run(store, &user, &input, &output, &a);
+    }
+
     let pdf_password = match pdf_password(&a.pdf_password_file)? {
         Some(p) => Some(p),
-        None if pdf::source::Source::needs_password(&input) => Some(rpassword::prompt_password("PDF password: ")?),
+        None if pdf::source::Source::needs_password(&input) => Some(prompt_secret("PDF password: ", "--pdf-password-file or $FIRMA_PDF_PASSWORD")?),
         None => None,
     };
     let pdf_password = pdf_password.as_deref();
@@ -585,6 +592,82 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     Ok(())
 }
 
+/// `firma sign --dry-run`: validates the request and describes it, without touching the certificate.
+fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs) -> Result<()> {
+    let config = store.config()?;
+    let level = match (a.level, &config.level) {
+        (Some(l), _) => l,
+        (None, Some(l)) => Level::parse(l)?,
+        (None, None) => Level::B,
+    };
+    let signature = user.signature();
+    let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some();
+    if !a.at.is_empty() && signature.is_none() && !stamp {
+        bail!("user '{}' has no handwritten signature; add one with `firma user signature` or use --stamp", a.user);
+    }
+    let mut stamp_at = a.stamp_at.clone();
+    if stamp && a.at.is_empty() && stamp_at.is_empty() {
+        stamp_at.push("last:bottom-left".parse()?);
+    }
+
+    println!("Dry run: nothing has been signed.");
+    println!("  signer:      {} ({}), certificate by {}, expires {}", a.user, user.meta.holder, user.meta.issuer, user.meta.expires);
+    println!("  input:       {}", a.input.display());
+    println!("  output:      {}{}", output.display(), if output.exists() { " (exists, --force given)" } else { "" });
+    println!("  level:       {}", level.name());
+    if level >= Level::T {
+        let tsa = tsa_settings_no_secret(a, &config);
+        println!("  TSA:         {tsa}");
+    }
+
+    let password = pdf_password(&a.pdf_password_file)?;
+    if password.is_none() && pdf::source::Source::needs_password(input) {
+        println!("  PDF:         encrypted; its password will be asked (or use --pdf-password-file)");
+        return Ok(());
+    }
+    let src = pdf::source::Source::open(input, password.as_deref())?;
+    println!(
+        "  PDF:         {} page(s){}",
+        src.doc.get_pages().len(),
+        if src.doc.encryption_state.is_some() { ", encrypted" } else { "" }
+    );
+    let describe = |label: &str, boxes: Vec<pdf::sign::BoxPreview>| {
+        for (page, rotate, (w, h)) in boxes {
+            let rot = if rotate != 0 { format!(" (page rotated {rotate}°)") } else { String::new() };
+            println!("  {label:<12} page {page}, {w:.0}x{h:.0} mm{rot}");
+        }
+    };
+    describe("signature:", pdf::sign::preview_boxes(&src.doc, &a.at, pdf::sign::DEFAULT_SIGNATURE_SIZE)?);
+    describe("stamp:", pdf::sign::preview_boxes(&src.doc, &stamp_at, pdf::sign::DEFAULT_STAMP_SIZE)?);
+    if a.at.is_empty() && stamp_at.is_empty() {
+        println!("  visible:     no (invisible signature)");
+    }
+    if stamp {
+        let now = chrono::Local::now();
+        let text = a
+            .text
+            .as_deref()
+            .unwrap_or(DEFAULT_TEXT)
+            .replace("{name}", &user.meta.holder)
+            .replace("{issuer}", &user.meta.issuer)
+            .replace("{date}", &now.format("%Y-%m-%d").to_string())
+            .replace("{time}", &now.format("%H:%M").to_string())
+            .replace("{reason}", a.reason.as_deref().unwrap_or(""))
+            .replace("{location}", a.location.as_deref().unwrap_or(""));
+        println!("  stamp text:  {text}");
+    }
+    Ok(())
+}
+
+/// The TSA as a display string (URL and user), without reading any password.
+fn tsa_settings_no_secret(a: &SignArgs, config: &Config) -> String {
+    let url = a.tsa.clone().or(config.tsa.clone()).or_else(|| std::env::var("FIRMA_TSA").ok()).unwrap_or_else(|| DEFAULT_TSA.to_string());
+    match a.tsa_user.clone().or(config.tsa_user.clone()) {
+        Some(u) => format!("{url} (user {u})"),
+        None => url,
+    }
+}
+
 fn tsa_settings(a: &SignArgs, config: &Config) -> Result<tsa::Tsa> {
     let url = a
         .tsa
@@ -600,7 +683,7 @@ fn tsa_settings(a: &SignArgs, config: &Config) -> Result<tsa::Tsa> {
         (_, Some(f)) => Some(read_secret_file(f)?),
         (Some(u), None) => Some(match std::env::var("FIRMA_TSA_PASSWORD") {
             Ok(p) => p,
-            Err(_) => rpassword::prompt_password(format!("TSA password for {u}: "))?,
+            Err(_) => prompt_secret(&format!("TSA password for {u}: "), "--tsa-password-file or $FIRMA_TSA_PASSWORD")?,
         }),
         (None, None) => None,
     };
@@ -630,7 +713,15 @@ fn read_password(args: &PasswordArgs, prompt: &str) -> Result<String> {
     if let Ok(p) = std::env::var("FIRMA_PASSWORD") {
         return Ok(p);
     }
-    Ok(rpassword::prompt_password(prompt)?)
+    prompt_secret(prompt, "--password-file or $FIRMA_PASSWORD")
+}
+
+/// Asks for a secret on the terminal. Without one (e.g. when run by an AI agent or a script),
+/// explains how else to provide it.
+fn prompt_secret(prompt: &str, alternatives: &str) -> Result<String> {
+    rpassword::prompt_password(prompt).map_err(|e| {
+        anyhow::anyhow!("cannot ask for the password: no terminal available ({e}); provide it with {alternatives}")
+    })
 }
 
 fn confirm(prompt: &str) -> Result<bool> {

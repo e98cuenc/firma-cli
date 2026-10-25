@@ -1,0 +1,77 @@
+# firma CLI reference
+
+All commands accept `--home DIR` (data directory). The default is `$FIRMA_HOME`, then `~/.config/firma`,
+then `%APPDATA%\firma` on Windows. `firma <command> --help` shows the full help.
+
+## Users
+
+```sh
+firma user add NAME --cert CERT.p12 [--image IMG [--remove-background] | --preview | --from-pdf PDF [--index N]] [--password-file F]
+firma user signature NAME (--image IMG [--remove-background] | --preview | --from-pdf PDF [--index N])
+firma user cert NAME NEW.p12 [--password-file F]     # replace an expired or renewed certificate
+firma user list                                      # alias: ls
+firma user info NAME
+firma user remove NAME [--yes]                       # alias: rm; deletes the certificate copy
+```
+
+- `--image` takes a PNG or JPEG. `--remove-background` makes white transparent, and the image is cropped to its content.
+- `--preview` (macOS only, interactive): opens a template in Preview. The user places their saved signature,
+  saves with ⌘S and presses Enter. The signature is imported as vector graphics.
+- `--from-pdf`: imports a signature annotation from a PDF the user signed in Preview.
+
+## Signing
+
+```sh
+firma sign INPUT.pdf -u NAME [options]
+```
+
+| Option | Meaning |
+|---|---|
+| `-o, --output FILE` | Output file (default `INPUT_signed.pdf`) |
+| `-f, --force` | Overwrite the output |
+| `--at PAGE:POS[:WxH]` | Visible signature box, repeatable |
+| `-s, --stamp` | Add the "Digitally signed by …" text (inside the `--at` boxes, or alone at `last:bottom-left`) |
+| `--stamp-at PAGE:POS[:WxH]` | Text-only stamp box, repeatable (implies `--stamp`) |
+| `--text TEMPLATE` | Stamp text. Variables: `{name} {id} {issuer} {date} {time} {reason} {location}`; `\n` = new line |
+| `--reason`, `--location`, `--contact` | Stored in the signature |
+| `--level b\|t\|lt\|lta` | PAdES level (default from `firma config`, else `b`) |
+| `--tsa URL` | Time-stamping authority (default `http://tsa.izenpe.com`) |
+| `--tsa-user USER`, `--tsa-password-file F`, `--tsa-policy OID` | Authenticated TSA (credentials are only sent over https) |
+| `--pdf-password-file F` | Password of an encrypted PDF |
+| `--password-file F` | Certificate password |
+| `--pkcs7` | `adbe.pkcs7.detached` instead of `ETSI.CAdES.detached` |
+| `--reserve BYTES` | Space reserved for the signature (rarely needed) |
+| `--dry-run` | Validate and describe, without signing or asking for passwords |
+
+Positions:
+- PAGE: `1`, `2`, …, `-1` (last), `first`, `last`, `all`.
+- POS: `bottom-right`, `bottom-left`, `bottom-center`, `top-right`, `top-left`, `top-center`, `center`, or
+  `X,Y` in mm from the bottom-left corner of the page as displayed (rotated pages are handled).
+- Default sizes: 60x25 mm for `--at`, 80x18 mm for `--stamp-at`.
+
+Levels:
+
+| Level | Contents | Network |
+|---|---|---|
+| `b` | Basic PAdES signature | no |
+| `t` | + RFC 3161 signature time-stamp | TSA |
+| `lt` | + DSS with the chain and OCSP/CRL data; aborts if the certificate is revoked | TSA, OCSP/CRL |
+| `lta` | + document time-stamp for long-term archival | TSA, OCSP/CRL |
+
+## Preferences
+
+```sh
+firma config                                  # show
+firma config --level lt --tsa https://… --tsa-user USER --tsa-policy OID
+```
+
+## Environment variables
+
+| Variable | Use |
+|---|---|
+| `FIRMA_HOME` | Data directory |
+| `FIRMA_PASSWORD`, `FIRMA_PDF_PASSWORD`, `FIRMA_TSA_PASSWORD` | Passwords. Meant for the user's own scripts; an agent must not set them |
+| `FIRMA_TSA` | Default TSA URL |
+| `FIRMA_ALLOW_PRIVATE_NETWORK=1` | Allow OCSP/CRL/AIA URLs on private networks (internal corporate CA) |
+| `FIRMA_ALLOW_INSECURE_AUTH=1` | Allow TSA credentials over plain http |
+| `HTTPS_PROXY`, `HTTP_PROXY` | Proxy |

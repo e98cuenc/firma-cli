@@ -28,6 +28,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Check skill metadata
+        run: python3 scripts/check-skill.py plugins/firma/skills/sign-pdf
 
   build:
     name: build (${{ matrix.name }})
@@ -97,21 +100,20 @@ jobs:
       - name: Smoke test
         run: scripts/smoke-test.sh dist/firma
 
+      # Archive names carry no version so that .../releases/latest/download/<name> always works
+      # (the skill's install scripts rely on it).
       - name: Package
         id: package
         env:
           NAME: ${{ matrix.name }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "$REF_TYPE" = "tag" ]; then version="$REF_NAME"; else version="dev-${GITHUB_SHA::7}"; fi
           cp README.md dist/
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
-            archive="firma-$version-$NAME.zip"
+            archive="firma-$NAME.zip"
             7z a "../$archive" firma.exe README.md
           else
-            archive="firma-$version-$NAME.tar.gz"
+            archive="firma-$NAME.tar.gz"
             tar czf "../$archive" firma README.md
           fi
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
@@ -122,9 +124,44 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
+  skill:
+    name: skill (sign-pdf)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build skill with bundled binaries
+        run: |
+          mkdir -p bins
+          for p in macos-universal x86_64-linux aarch64-linux; do
+            mkdir -p "bins/$p" && tar -xzf "artifacts/firma-$p.tar.gz" -C "bins/$p" firma
+          done
+          mkdir -p bins/x86_64-windows && unzip -q artifacts/firma-x86_64-windows.zip firma.exe -d bins/x86_64-windows
+          scripts/build-skill.sh sign-pdf-skill.zip \
+            macos-universal=bins/macos-universal/firma \
+            x86_64-linux=bins/x86_64-linux/firma \
+            aarch64-linux=bins/aarch64-linux/firma \
+            x86_64-windows=bins/x86_64-windows/firma.exe
+      - name: Smoke test the bundled Linux binary
+        run: |
+          mkdir unpacked && unzip -q sign-pdf-skill.zip -d unpacked
+          bin="$(PATH=/usr/bin:/bin unpacked/sign-pdf/scripts/locate.sh)"
+          scripts/smoke-test.sh "$bin"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sign-pdf-skill
+          path: sign-pdf-skill.zip
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, skill]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -135,7 +172,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: artifacts
-        run: sha256sum firma-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+        run: sha256sum firma-* sign-pdf-skill.zip > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: artifacts/*

@@ -28,6 +28,12 @@ impl<'a> Source<'a> {
             lopdf::Error::Decryption(d) => anyhow!("could not decrypt the PDF: {d:?}"),
             e => anyhow!(e).context("could not read the PDF"),
         })?;
+        if not_decrypted(&doc) {
+            bail!(
+                "the PDF is password-protected and the password is missing or wrong \
+                 (use --pdf-password-file or $FIRMA_PDF_PASSWORD)"
+            );
+        }
         if doc.xref_start == 0 {
             bail!("the PDF cross-reference table was not found");
         }
@@ -54,7 +60,11 @@ impl<'a> Source<'a> {
 
     /// Whether `bytes` is a PDF that cannot be opened without a password.
     pub fn needs_password(bytes: &[u8]) -> bool {
-        matches!(Document::load_mem(bytes), Err(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_)))
+        match Document::load_mem(bytes) {
+            Err(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_)) => true,
+            Ok(doc) => not_decrypted(&doc),
+            Err(_) => false,
+        }
     }
 
     pub fn root_id(&self) -> Result<ObjectId> {
@@ -100,6 +110,12 @@ impl<'a> Source<'a> {
         }
         Ok(write::incremental(self.bytes, self.doc.xref_start, &trailer, objects))
     }
+}
+
+/// lopdf may load an encrypted PDF it could not decrypt without failing: it then keeps /Encrypt
+/// in the trailer and has no encryption state.
+fn not_decrypted(doc: &Document) -> bool {
+    doc.trailer.get(b"Encrypt").is_ok() && doc.encryption_state.is_none()
 }
 
 /// The last `/Encrypt N G R` reference in the file that `accept` confirms.

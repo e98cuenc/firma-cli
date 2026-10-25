@@ -1,0 +1,14 @@
+{
+  "name": "firma-cli",
+  "description": "PDF digital signing (PAdES) with your own certificate, via the firma CLI",
+  "owner": {
+    "name": "Joaquín Cuenca Abela"
+  },
+  "plugins": [
+    {
+      "name": "firma",
+      "source": "./plugins/firma",
+      "description": "Sign PDFs (PAdES B-B to B-LTA) with your certificate, visible signature and AutoFirma-style stamp"
+    }
+  ]
+}

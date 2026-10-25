@@ -743,3 +743,19 @@ fn pdf_date(d: &chrono::DateTime<chrono::Local>) -> String {
     let off = off.abs();
     format!("{}{}{:02}'{:02}'", d.format("D:%Y%m%d%H%M%S"), sign, off / 3600, (off % 3600) / 60)
 }
+
+/// Page number, page rotation and size in mm of each box `placements` resolve to (for previews).
+/// A box preview: page number, page /Rotate and size in mm.
+pub type BoxPreview = (u32, i64, (f64, f64));
+
+pub fn preview_boxes(doc: &Document, placements: &[Placement], default_size: (f64, f64)) -> Result<Vec<BoxPreview>> {
+    let pages = doc.get_pages();
+    let number: BTreeMap<ObjectId, u32> = pages.iter().map(|(n, id)| (*id, *n)).collect();
+    let mut out = Vec::new();
+    for p in placements {
+        for (page, _, rotate, (w, h)) in resolve_placement(doc, &pages, p, default_size)? {
+            out.push((number[&page], rotate, (w / MM, h / MM)));
+        }
+    }
+    Ok(out)
+}
