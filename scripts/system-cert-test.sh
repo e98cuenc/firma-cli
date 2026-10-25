@@ -17,9 +17,12 @@ native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else pri
 # macOS `security import` only reads PKCS#12 files with the legacy algorithms.
 legacy=()
 if [ "$(uname -s)" = Darwin ] && openssl version | grep -q "^OpenSSL 3"; then legacy=(-legacy); fi
-openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/u.key" -out "$WORK/u.crt" -days 2 \
-  -subj "/CN=$FIRMA_TEST_SYSTEM_CERT" 2>/dev/null
-openssl pkcs12 -export ${legacy[@]+"${legacy[@]}"} -inkey "$WORK/u.key" -in "$WORK/u.crt" -out "$WORK/u.p12" -passout pass:test
+# Relative paths inside $WORK: Git for Windows' openssl does not understand /tmp/... paths.
+(
+  cd "$WORK"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout u.key -out u.crt -days 2 -subj "/CN=$FIRMA_TEST_SYSTEM_CERT"
+  openssl pkcs12 -export ${legacy[@]+"${legacy[@]}"} -inkey u.key -in u.crt -out u.p12 -passout pass:test
+)
 "$PY" "$(native "$(dirname "$0")/test-pdf.py")" "$(native "$WORK/doc.pdf")"
 
 case "$(uname -s)" in
