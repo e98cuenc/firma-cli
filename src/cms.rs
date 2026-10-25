@@ -109,7 +109,7 @@ fn signing_certificate_v2(cert_der: &[u8], cert: &Certificate) -> Result<Vec<u8>
     Ok(tlv(0x30, &tlv(0x30, &ess_cert_id)))
 }
 
-fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+pub(crate) fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let len = content.len();
     if len < 0x80 {

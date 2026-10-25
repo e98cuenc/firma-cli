@@ -16,6 +16,7 @@ der = { version = "0.7", features = ["alloc", "oid"] }
 dirs = "6"
 ecdsa = { version = "0.16", features = ["der", "signing"] }
 flate2 = "1"
+hmac = "0.12"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg"] }
 lopdf = { version = "~0.40", default-features = false }
 p12-keystore = "0.4.1"

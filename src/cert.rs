@@ -68,9 +68,16 @@ pub struct CertInfo {
 
 impl Credential {
     pub fn load(p12: &[u8], password: &str) -> Result<Self> {
-        let archive = Pkcs12Archive::from_pkcs12(p12, password).map_err(|e| {
-            anyhow!("could not open the PKCS#12 (wrong password or unsupported format?): {e}")
-        })?;
+        let archive = match Pkcs12Archive::from_pkcs12(p12, password) {
+            Ok(a) => a,
+            // BER-encoded files (Java/BouncyCastle exports) are rebuilt as DER first.
+            Err(_) if crate::ber::is_ber(p12) => {
+                let der = crate::ber::pkcs12_to_der(p12, password).context("could not open the PKCS#12")?;
+                Pkcs12Archive::from_pkcs12(&der, password)
+                    .map_err(|e| anyhow!("could not open the PKCS#12 (BER-encoded): {e}"))?
+            }
+            Err(e) => bail!("could not open the PKCS#12 (wrong password or unsupported format?): {e}"),
+        };
         let mut keys = Vec::new();
         for bag in &archive.keys {
             keys.push(parse_key(bag.key.as_der())?);

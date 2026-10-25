@@ -1,3 +1,4 @@
+mod ber;
 mod cert;
 mod cms;
 mod net;

@@ -777,6 +777,7 @@ dependencies = [
  "dirs",
  "ecdsa",
  "flate2",
+ "hmac 0.12.1",
  "image",
  "lopdf",
  "p12-keystore",
