@@ -45,7 +45,7 @@ case "$(uname -s)" in
       cargo test --locked -- --ignored system
 
       "$FIRMA" certs | grep "$FIRMA_TEST_SYSTEM_CERT"
-      rm -rf "$FIRMA_HOME"
+      "$FIRMA" user remove sys --yes 2>/dev/null || true
       "$FIRMA" user add sys --system-cert "firma system test"
       doc="$(native "$WORK/doc.pdf")"
       "$FIRMA" sign "$doc" -u sys --stamp --dry-run | grep "approval:.*Windows Hello"
