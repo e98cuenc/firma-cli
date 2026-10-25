@@ -1,6 +1,7 @@
 mod ber;
 mod cert;
 mod cms;
+mod keystore;
 mod net;
 mod pdf;
 mod preview;
@@ -42,6 +43,8 @@ enum Cmd {
     User(UserCmd),
     /// Sign a PDF
     Sign(Box<SignArgs>),
+    /// List the certificates with a private key in the macOS Keychain / Windows certificate store
+    Certs,
     /// Show or change preferences (default PAdES level and TSA)
     Config {
         /// Default PAdES level
@@ -90,12 +93,15 @@ impl Level {
 
 #[derive(Subcommand)]
 enum UserCmd {
-    /// Add a user with their certificate (.p12/.pfx)
+    /// Add a user with their certificate (a .p12/.pfx file, or one in the system store)
     Add {
         name: String,
-        /// PKCS#12 certificate (.p12 / .pfx) with the private key
-        #[arg(long, short = 'c')]
-        cert: PathBuf,
+        #[command(flatten)]
+        cert: CertArgs,
+        /// Do not ask for Touch ID / Windows Hello before each signature with a system certificate
+        /// (asks for it once now, to confirm)
+        #[arg(long, requires = "system_cert")]
+        no_presence_check: bool,
         #[command(flatten)]
         signature: SignatureArgs,
         #[command(flatten)]
@@ -107,13 +113,17 @@ enum UserCmd {
         #[command(flatten)]
         signature: SignatureArgs,
     },
-    /// Replace a user's certificate (e.g. after renewing it)
+    /// Replace a user's certificate (e.g. after renewing it, or to move it to the system store)
     Cert {
         name: String,
-        cert: PathBuf,
+        #[command(flatten)]
+        cert: CertArgs,
         #[command(flatten)]
         password: PasswordArgs,
     },
+    /// Turn on or off the Touch ID / Windows Hello check before each signature with a system
+    /// certificate (turning it off asks for it once, to confirm)
+    PresenceCheck { name: String, state: OnOff },
     /// List users
     #[command(visible_alias = "ls")]
     List,
@@ -127,6 +137,24 @@ enum UserCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct CertArgs {
+    /// PKCS#12 certificate (.p12 / .pfx) with the private key; firma keeps a copy
+    #[arg(long, short = 'c', value_name = "FILE")]
+    cert: Option<PathBuf>,
+    /// A certificate in the macOS Keychain / Windows certificate store, by SHA-1 fingerprint or
+    /// part of the holder's name (see `firma certs`). The key stays there and no password is needed
+    #[arg(long, value_name = "QUERY")]
+    system_cert: Option<String>,
 }
 
 #[derive(Args)]
@@ -237,6 +265,23 @@ fn run() -> Result<()> {
     match cli.cmd {
         Cmd::User(c) => user_cmd(&store, c),
         Cmd::Sign(a) => sign_cmd(&store, *a),
+        Cmd::Certs => {
+            let certs = keystore::list()?;
+            if certs.is_empty() {
+                println!("No certificates with a private key in the {}.", keystore::STORE);
+            }
+            let users = store.list()?;
+            for c in certs {
+                let used: Vec<&str> = users
+                    .iter()
+                    .filter(|u| u.meta.system_cert.as_deref() == Some(c.sha1.as_str()))
+                    .map(|u| u.meta.name.as_str())
+                    .collect();
+                let used = if used.is_empty() { String::new() } else { format!("  [user {}]", used.join(", ")) };
+                println!("{}{used}", keystore::describe(&c));
+            }
+            Ok(())
+        }
         Cmd::Config { level, tsa, tsa_user, tsa_policy } => {
             let mut config = store.config()?;
             if level.is_none() && tsa.is_none() && tsa_user.is_none() && tsa_policy.is_none() {
@@ -273,14 +318,21 @@ fn run() -> Result<()> {
 
 fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
     match cmd {
-        UserCmd::Add { name, cert, signature, password } => {
-            let p12 = fs::read(&cert).with_context(|| format!("reading {}", cert.display()))?;
-            let password = read_password(&password, &format!("Password for {}: ", cert.display()))?;
-            let cred = Credential::load(&p12, &password)?;
+        UserCmd::Add { name, cert, no_presence_check, signature, password } => {
+            if store.user(&name).is_ok() {
+                bail!("user '{name}' already exists");
+            }
+            let source = cert_source(&cert, &password)?;
+            if no_presence_check {
+                confirm_presence_off(&name)?;
+            }
             let mut user = store.create_user(&name)?;
             let result = (|| {
-                write_private(&user.cert_path(), &p12)?;
-                update_meta(&mut user, &cred)?;
+                set_cert(&mut user, source)?;
+                if no_presence_check {
+                    user.meta.presence_check = Some(false);
+                    user.save_meta()?;
+                }
                 set_signature(&user, &signature)
             })();
             if result.is_err() {
@@ -300,11 +352,24 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
         }
         UserCmd::Cert { name, cert, password } => {
             let mut user = store.user(&name)?;
-            let p12 = fs::read(&cert).with_context(|| format!("reading {}", cert.display()))?;
-            let password = read_password(&password, &format!("Password for {}: ", cert.display()))?;
-            let cred = Credential::load(&p12, &password)?;
-            write_private(&user.cert_path(), &p12)?;
-            update_meta(&mut user, &cred)?;
+            let source = cert_source(&cert, &password)?;
+            set_cert(&mut user, source)?;
+            print_user(&user);
+            Ok(())
+        }
+        UserCmd::PresenceCheck { name, state } => {
+            let mut user = store.user(&name)?;
+            if user.meta.system_cert.is_none() {
+                bail!("user '{name}' uses a .p12 file, which is protected by its password instead");
+            }
+            match state {
+                OnOff::On => user.meta.presence_check = None,
+                OnOff::Off => {
+                    confirm_presence_off(&name)?;
+                    user.meta.presence_check = Some(false);
+                }
+            }
+            user.save_meta()?;
             print_user(&user);
             Ok(())
         }
@@ -319,7 +384,8 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
                     Some((SignatureKind::Vector, _)) => "signature: vector",
                     None => "no signature",
                 };
-                println!("{:<16} {}  (expires {}, {sig})", u.meta.name, u.meta.holder, u.meta.expires);
+                let store = if u.meta.system_cert.is_some() { format!(", {}", keystore::STORE) } else { String::new() };
+                println!("{:<16} {}  (expires {}, {sig}{store})", u.meta.name, u.meta.holder, u.meta.expires);
             }
             Ok(())
         }
@@ -329,7 +395,11 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
         }
         UserCmd::Remove { name, yes } => {
             let user = store.user(&name)?;
-            if !yes && !confirm(&format!("Delete user '{name}' and their certificate from {}? [y/N] ", user.dir.display()))? {
+            let what = match user.meta.system_cert {
+                Some(_) => format!("from {} (the certificate stays in the {})", user.dir.display(), keystore::STORE),
+                None => format!("and their certificate from {}", user.dir.display()),
+            };
+            if !yes && !confirm(&format!("Delete user '{name}' {what}? [y/N] "))? {
                 println!("Cancelled.");
                 return Ok(());
             }
@@ -340,8 +410,60 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
     }
 }
 
-fn update_meta(user: &mut User, cred: &Credential) -> Result<()> {
-    let info = cred.info();
+/// A certificate given to `user add` / `user cert`, already checked.
+enum CertSource {
+    P12(Vec<u8>, cert::CertInfo),
+    System(keystore::Identity),
+}
+
+fn cert_source(args: &CertArgs, password: &PasswordArgs) -> Result<CertSource> {
+    if let Some(query) = &args.system_cert {
+        let id = keystore::find(query)?;
+        // Make sure the key can be used (and its type is supported) before saving anything.
+        Credential::system(&id.sha1)?;
+        return Ok(CertSource::System(id));
+    }
+    let path = args.cert.as_ref().expect("clap requires --cert or --system-cert");
+    let p12 = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let password = read_password(password, &format!("Password for {}: ", path.display()))?;
+    let info = Credential::load(&p12, &password)?.info();
+    Ok(CertSource::P12(p12, info))
+}
+
+fn set_cert(user: &mut User, source: CertSource) -> Result<()> {
+    let info = match source {
+        CertSource::P12(p12, info) => {
+            write_private(&user.cert_path(), &p12)?;
+            user.meta.system_cert = None;
+            user.meta.presence_check = None;
+            info
+        }
+        CertSource::System(id) => {
+            // No copy of the certificate is kept: the system store has it.
+            if user.cert_path().exists() {
+                fs::remove_file(user.cert_path())?;
+                println!("Removed firma's copy of the .p12; the certificate stays in the {}.", keystore::STORE);
+            }
+            // Turning the check off was approved for one certificate only.
+            if user.meta.system_cert.as_deref() != Some(id.sha1.as_str()) && user.meta.presence_check.is_some() {
+                user.meta.presence_check = None;
+                println!("The {} check is on again for the new certificate.", keystore::PRESENCE);
+            }
+            user.meta.system_cert = Some(id.sha1);
+            id.info
+        }
+    };
+    update_meta(user, &info)
+}
+
+/// Turning off the presence check for a system certificate needs the user there, so that a
+/// script or agent cannot do it on its own.
+fn confirm_presence_off(name: &str) -> Result<()> {
+    keystore::verify_presence(&format!("stop asking for {} when signing as {name}", keystore::PRESENCE))
+}
+
+fn update_meta(user: &mut User, info: &cert::CertInfo) -> Result<()> {
+    let info = info.clone();
     user.meta.holder = info.holder;
     user.meta.issuer = info.issuer;
     user.meta.expires = info.not_after.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
@@ -353,7 +475,14 @@ fn print_user(u: &User) {
     println!("  holder:      {}", u.meta.holder);
     println!("  issuer:      {}", u.meta.issuer);
     println!("  expires:     {}", u.meta.expires);
-    println!("  certificate: {}", u.cert_path().display());
+    match &u.meta.system_cert {
+        Some(sha1) => {
+            println!("  certificate: {} ({sha1})", keystore::STORE);
+            let check = if u.meta.presence_check() { "before each signature" } else { "off" };
+            println!("  {:<12} {check}", format!("{}:", keystore::PRESENCE));
+        }
+        None => println!("  certificate: {}", u.cert_path().display()),
+    }
     match u.signature() {
         Some((k, p)) => println!(
             "  signature:   {} ({})",
@@ -462,9 +591,14 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     };
     let pdf_password = pdf_password.as_deref();
 
-    let p12 = fs::read(user.cert_path()).context("the user has no certificate")?;
-    let password = read_password(&a.password, &format!("Certificate password for '{}': ", a.user))?;
-    let mut cred = Credential::load(&p12, &password)?;
+    let mut cred = match &user.meta.system_cert {
+        Some(sha1) => Credential::system(sha1)?,
+        None => {
+            let p12 = fs::read(user.cert_path()).context("the user has no certificate")?;
+            let password = read_password(&a.password, &format!("Certificate password for '{}': ", a.user))?;
+            Credential::load(&p12, &password)?
+        }
+    };
     let info = cred.info();
     let now = chrono::Utc::now();
     if now > info.not_after {
@@ -472,6 +606,12 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     }
     if now < info.not_before {
         bail!("{}'s certificate is not valid until {}", info.holder, info.not_before.format("%Y-%m-%d"));
+    }
+    if user.meta.system_cert.is_some() && user.meta.presence_check() {
+        // The dialog names the document by its full path, so the user knows what they approve.
+        let path = fs::canonicalize(&a.input).unwrap_or_else(|_| a.input.clone());
+        let reason = format!("sign “{}” as {}", dialog_text(&path.to_string_lossy()), dialog_text(&info.holder));
+        keystore::verify_presence(&reason)?;
     }
 
     let signature = user.signature();
@@ -595,6 +735,11 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
 
 /// `firma sign --dry-run`: validates the request and describes it, without touching the certificate.
 fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs) -> Result<()> {
+    if let Some(sha1) = &user.meta.system_cert {
+        if !keystore::list()?.iter().any(|c| &c.sha1 == sha1) {
+            bail!("{}'s certificate is no longer in the {} (see `firma certs`)", a.user, keystore::STORE);
+        }
+    }
     let config = store.config()?;
     let level = match (a.level, &config.level) {
         (Some(l), _) => l,
@@ -616,6 +761,15 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
     println!("  input:       {}", a.input.display());
     println!("  output:      {}{}", output.display(), if output.exists() { " (exists, --force given)" } else { "" });
     println!("  level:       {}", level.name());
+    let approval = match &user.meta.system_cert {
+        Some(_) if user.meta.presence_check() => {
+            format!("{} ({}); the dialog names the document", keystore::PRESENCE, keystore::STORE)
+        }
+        Some(_) => format!("none ({}, presence check off)", keystore::STORE),
+        None if a.password.password_file.is_some() => "certificate password from --password-file".to_string(),
+        None => "certificate password, typed in the terminal".to_string(),
+    };
+    println!("  approval:    {approval}");
     if level >= Level::T {
         let tsa = tsa_settings_no_secret(a, &config);
         println!("  TSA:         {tsa}");
@@ -723,6 +877,11 @@ fn prompt_secret(prompt: &str, alternatives: &str) -> Result<String> {
     rpassword::prompt_password(prompt).map_err(|e| {
         anyhow::anyhow!("cannot ask for the password: no terminal available ({e}); provide it with {alternatives}")
     })
+}
+
+/// Text for a system dialog: no control characters or quotes that could fake its wording.
+fn dialog_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() && !matches!(c, '"' | '“' | '”')).collect()
 }
 
 fn confirm(prompt: &str) -> Result<bool> {

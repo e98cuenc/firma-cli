@@ -4,7 +4,9 @@ Command-line PAdES signing for PDFs — an alternative to Spain's AutoFirma.
 A single self-contained binary written in pure Rust: no Java, no OpenSSL, no external libraries
 (it only links against the operating system's own libraries).
 
-- Several users, each with their own certificate (`.p12`/`.pfx`) and handwritten signature (image or vector).
+- Several users, each with their own certificate and handwritten signature (image or vector). The certificate can
+  be a `.p12`/`.pfx` file or one already in the **macOS Keychain** or the **Windows certificate store**: then no
+  password is typed, the key never leaves the system, and each signature is approved with Touch ID / Windows Hello.
 - Visible signature in one or more places, on any page, including rotated pages.
 - AutoFirma-style text stamp ("Digitally signed by …") so anyone can see the document is signed.
 - PAdES B-B, B-T (RFC 3161 time-stamp), B-LT (embedded OCSP/CRL revocation data) and B-LTA
@@ -17,7 +19,9 @@ A single self-contained binary written in pure Rust: no Java, no OpenSSL, no ext
 The repo also ships `sign-pdf`, an [Agent Skill](https://agentskills.io) that lets an AI agent sign documents
 with `firma` on your behalf. It finds or installs the binary, checks the request with `firma sign --dry-run`,
 shows you a summary and asks for confirmation before signing. It never handles your passwords: you run the
-final command yourself, or point it to a password file only you can read.
+final command yourself, or point it to a password file only you can read. With a certificate in the Keychain /
+Windows certificate store the agent can run the command after you confirm, and you approve the signature with
+Touch ID / Windows Hello in a dialog that names the document.
 
 | Agent | Install |
 |---|---|
@@ -56,7 +60,8 @@ Release builds are produced by GitHub Actions (`.github/workflows/build.yml`) wh
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`scripts/smoke-test.sh [path/to/firma]` creates a throw-away certificate and signs a PDF. CI runs it on every platform.
+`scripts/smoke-test.sh [path/to/firma]` creates a throw-away certificate and signs a PDF. CI runs it on every platform,
+and `scripts/system-cert-test.sh` on macOS and Windows (a throw-away keychain / the runner's certificate store).
 
 ## Users
 
@@ -65,19 +70,46 @@ Each user has a certificate and, optionally, a handwritten signature. Everything
 Files are mode 0600:
 
 ```text
-user.toml          holder, issuer and expiry date
-certificate.p12    as-is, encrypted with its own password (the password is never stored)
+user.toml          holder, issuer, expiry date (and the fingerprint of a system certificate)
+certificate.p12    as-is, encrypted with its own password (the password is never stored); not
+                   present when the certificate is in the Keychain / Windows certificate store
 signature.png      handwritten signature as an image, or
 signature.pdf      vector handwritten signature imported from Preview
 ```
 
 ```sh
 firma user add ana --cert ana.p12 --image signature.png --remove-background
+firma user add ana --system-cert "ana garcia"  # a certificate in the Keychain / Windows store
 firma user signature ana --preview            # opens Preview: place your signature, ⌘S, Enter
 firma user signature ana --from-pdf signed_in_preview.pdf
-firma user cert ana renewed.p12               # after renewing the certificate
+firma user cert ana --cert renewed.p12        # after renewing the certificate
 firma user list | info ana | remove ana
 ```
+
+### Certificates in the Keychain / Windows certificate store
+
+If the certificate is already installed on the computer (imported by double-clicking the `.p12`, by the FNMT
+website, by AutoFirma…), use it from there instead of a file:
+
+```sh
+firma certs                                     # certificates with a private key in the system store
+firma user add ana --system-cert 8B59669F       # by SHA-1 fingerprint (or its first 8+ digits)
+firma user add ana --system-cert "sanchez ruiz" # or part of the holder's name / ID, if unambiguous
+firma user cert ana --system-cert 8B59669F      # move an existing user to it (deletes firma's .p12 copy)
+```
+
+- macOS: the identities (certificate + private key) in your keychains. Windows: the current user's "Personal"
+  store; keys are used through CNG, including those imported into legacy CryptoAPI providers.
+- The private key never leaves the system and `firma` never sees a password. The system signs for it, and may
+  show its own dialog the first time ("firma wants to sign using key…" on macOS; **Always Allow** is fine,
+  because of the next point; the PIN dialog of a smart card).
+- Before each signature, `firma` asks for **Touch ID** (macOS, falling back to your account password) or
+  **Windows Hello** (PIN, fingerprint or face). The dialog names the document and the signer, so nothing
+  can sign as you, and no agent can sign on your behalf, without you there. It can be turned off with
+  `firma user presence-check ana off`, which itself asks for Touch ID / Windows Hello once. (A program that
+  can edit your files could still change `user.toml`; the check protects against misuse of the command,
+  not against malware running as you.)
+- Linux has no such store: use `.p12` files there.
 
 ### Signature from Preview
 
@@ -106,9 +138,10 @@ firma sign contract.pdf -u ana --at 1:120,40:70x30 --stamp-at 1:top-right \
 - `--text` customizes the stamp. Available variables: `{name} {id} {issuer} {date} {time} {reason} {location}`.
   `\n` inserts a line break. For example, an AutoFirma-like Spanish stamp:
   `--text 'Firmado por {name} el {date} con un certificado emitido por {issuer}'`.
-- The password is prompted in the terminal. It can also come from `$FIRMA_PASSWORD` or `--password-file`.
-- `--dry-run` validates everything (user, pages, positions, level) and prints what would be signed, without
-  asking for any password or writing anything.
+- The password of a `.p12` is prompted in the terminal. It can also come from `$FIRMA_PASSWORD` or
+  `--password-file`. With a system certificate there is no password; Touch ID / Windows Hello is asked instead.
+- `--dry-run` validates everything (user, pages, positions, level) and prints what would be signed and how it will
+  be approved, without asking for any password or writing anything.
 - Encrypted PDFs are supported. The new objects are encrypted with the document's own key, and the document's
   permissions are respected (adding annotations must be allowed). If the PDF needs a password to open, it is
   prompted, or read from `$FIRMA_PDF_PASSWORD` or `--pdf-password-file`.

@@ -1,4 +1,4 @@
-//! Certificate loading (PKCS#12) and low-level signing.
+//! Certificate loading (PKCS#12 or the system store) and low-level signing.
 
 use anyhow::{anyhow, bail, Context, Result};
 use der::asn1::ObjectIdentifier;
@@ -16,6 +16,47 @@ pub enum Key {
     Rsa(Box<rsa::RsaPrivateKey>),
     P256(p256::SecretKey),
     P384(p384::SecretKey),
+    /// Held by the operating system (macOS Keychain, Windows certificate store): it never
+    /// leaves it, the system signs for us.
+    System(crate::keystore::SystemKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAlg {
+    Rsa,
+    P256,
+    P384,
+}
+
+const OID_RSA: &str = "1.2.840.113549.1.1.1";
+const OID_EC: &str = "1.2.840.10045.2.1";
+const OID_P256: &str = "1.2.840.10045.3.1.7";
+const OID_P384: &str = "1.3.132.0.34";
+
+impl KeyAlg {
+    /// The key type of a certificate's public key.
+    pub fn of(cert: &Certificate) -> Result<Self> {
+        let alg = &cert.tbs_certificate.subject_public_key_info.algorithm;
+        match alg.oid.to_string().as_str() {
+            OID_RSA => Ok(KeyAlg::Rsa),
+            OID_EC => {
+                let curve = alg.parameters.as_ref().and_then(|p| p.decode_as::<ObjectIdentifier>().ok());
+                match curve.map(|c| c.to_string()).as_deref() {
+                    Some(OID_P256) => Ok(KeyAlg::P256),
+                    Some(OID_P384) => Ok(KeyAlg::P384),
+                    _ => bail!("unsupported EC curve (P-256 and P-384 are supported)"),
+                }
+            }
+            other => bail!("unsupported key type {other} (RSA, EC P-256 and EC P-384 are supported)"),
+        }
+    }
+
+    pub fn digest(self) -> Digest {
+        match self {
+            KeyAlg::P384 => Digest::Sha384,
+            _ => Digest::Sha256,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +98,7 @@ pub struct Credential {
     pub chain_der: Vec<Vec<u8>>,
 }
 
+#[derive(Clone)]
 pub struct CertInfo {
     pub holder: String,
     pub issuer: String,
@@ -113,34 +155,36 @@ impl Credential {
         bail!("no certificate in the PKCS#12 matches its private key")
     }
 
+    /// A certificate whose private key is in the system store (`sha1` is its fingerprint).
+    pub fn system(sha1: &str) -> Result<Self> {
+        let (key, cert_der, chain_der) = crate::keystore::load(sha1)?;
+        let cert = Certificate::from_der(&cert_der).map_err(|e| anyhow!("unreadable certificate: {e}"))?;
+        Ok(Self { key: Key::System(key), cert, cert_der, chain_der })
+    }
+
     pub fn info(&self) -> CertInfo {
-        let tbs = &self.cert.tbs_certificate;
-        let subject_cn = name_attr(&tbs.subject, OID_CN);
-        let org = name_attr(&tbs.subject, OID_ORG);
-        CertInfo {
-            holder: subject_cn.or_else(|| org.clone()).unwrap_or_else(|| tbs.subject.to_string()),
-            issuer: name_attr(&tbs.issuer, OID_CN)
-                .or_else(|| name_attr(&tbs.issuer, OID_ORG))
-                .unwrap_or_else(|| tbs.issuer.to_string()),
-            id: name_attr(&tbs.subject, OID_SERIAL_NUMBER).map(|s| strip_id_prefix(&s)),
-            not_before: to_chrono(tbs.validity.not_before.to_unix_duration()),
-            not_after: to_chrono(tbs.validity.not_after.to_unix_duration()),
+        cert_info(&self.cert)
+    }
+
+    fn alg(&self) -> KeyAlg {
+        match &self.key {
+            Key::Rsa(_) => KeyAlg::Rsa,
+            Key::P256(_) => KeyAlg::P256,
+            Key::P384(_) => KeyAlg::P384,
+            Key::System(k) => k.alg,
         }
     }
 
     pub fn digest(&self) -> Digest {
-        match self.key {
-            Key::P384(_) => Digest::Sha384,
-            _ => Digest::Sha256,
-        }
+        self.alg().digest()
     }
 
     /// Signature algorithm identifier (OID, whether it takes a NULL parameter).
     pub fn signature_algorithm(&self) -> (ObjectIdentifier, bool) {
-        match self.key {
-            Key::Rsa(_) => (ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"), true),
-            Key::P256(_) => (ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), false),
-            Key::P384(_) => (ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3"), false),
+        match self.alg() {
+            KeyAlg::Rsa => (ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"), true),
+            KeyAlg::P256 => (ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), false),
+            KeyAlg::P384 => (ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3"), false),
         }
     }
 
@@ -162,7 +206,31 @@ impl Credential {
                 let sig: p384::ecdsa::Signature = sk.try_sign(data)?;
                 sig.to_der().as_bytes().to_vec()
             }
+            Key::System(k) => {
+                let sig = k.sign(&self.digest().hash(&[data]))?;
+                // The key is out of our sight: check it really belongs to the certificate.
+                let (oid, null) = self.signature_algorithm();
+                let alg = spki::AlgorithmIdentifierOwned { oid, parameters: null.then(der::Any::null) };
+                crate::verify::signature(&self.cert.tbs_certificate.subject_public_key_info, &alg, None, data, &sig)
+                    .context("the system's private key does not match the certificate")?;
+                sig
+            }
         })
+    }
+}
+
+pub fn cert_info(cert: &Certificate) -> CertInfo {
+    let tbs = &cert.tbs_certificate;
+    let subject_cn = name_attr(&tbs.subject, OID_CN);
+    let org = name_attr(&tbs.subject, OID_ORG);
+    CertInfo {
+        holder: subject_cn.or_else(|| org.clone()).unwrap_or_else(|| tbs.subject.to_string()),
+        issuer: name_attr(&tbs.issuer, OID_CN)
+            .or_else(|| name_attr(&tbs.issuer, OID_ORG))
+            .unwrap_or_else(|| tbs.issuer.to_string()),
+        id: name_attr(&tbs.subject, OID_SERIAL_NUMBER).map(|s| strip_id_prefix(&s)),
+        not_before: to_chrono(tbs.validity.not_before.to_unix_duration()),
+        not_after: to_chrono(tbs.validity.not_after.to_unix_duration()),
     }
 }
 
@@ -186,6 +254,7 @@ fn public_key_bits(key: &Key) -> Result<Vec<u8>> {
         Key::Rsa(k) => k.to_public_key().to_public_key_der()?.into_vec(),
         Key::P256(k) => k.public_key().to_public_key_der()?.into_vec(),
         Key::P384(k) => k.public_key().to_public_key_der()?.into_vec(),
+        Key::System(_) => bail!("system keys are matched by the system"),
     };
     let spki = spki::SubjectPublicKeyInfoRef::from_der(&spki_der).context("SPKI")?;
     Ok(spki.subject_public_key.raw_bytes().to_vec())

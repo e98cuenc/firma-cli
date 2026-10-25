@@ -6,9 +6,11 @@ then `%APPDATA%\firma` on Windows. `firma <command> --help` shows the full help.
 ## Users
 
 ```sh
-firma user add NAME --cert CERT.p12 [--image IMG [--remove-background] | --preview | --from-pdf PDF [--index N]] [--password-file F]
+firma user add NAME (--cert CERT.p12 | --system-cert QUERY) [--image IMG [--remove-background] | --preview | --from-pdf PDF [--index N]] [--password-file F]
 firma user signature NAME (--image IMG [--remove-background] | --preview | --from-pdf PDF [--index N])
-firma user cert NAME NEW.p12 [--password-file F]     # replace an expired or renewed certificate
+firma user cert NAME (--cert NEW.p12 | --system-cert QUERY) [--password-file F]  # renewed certificate, or move to the system store
+firma user presence-check NAME on|off                # Touch ID / Windows Hello before each signature (off asks for it once)
+firma certs                                          # certificates with a private key in the Keychain / Windows store
 firma user list                                      # alias: ls
 firma user info NAME
 firma user remove NAME [--yes]                       # alias: rm; deletes the certificate copy
@@ -18,6 +20,9 @@ firma user remove NAME [--yes]                       # alias: rm; deletes the ce
 - `--preview` (macOS only, interactive): opens a template in Preview. The user places their saved signature,
   saves with ⌘S and presses Enter. The signature is imported as vector graphics.
 - `--from-pdf`: imports a signature annotation from a PDF the user signed in Preview.
+- `--system-cert QUERY` uses a certificate in the macOS Keychain or the Windows certificate store (not on Linux):
+  QUERY is its SHA-1 fingerprint (8+ hex digits are enough) or part of the holder's name or ID. No password is
+  involved; the key stays in the system. Signing asks for Touch ID / Windows Hello unless the user turned it off.
 
 ## Signing
 
@@ -38,10 +43,10 @@ firma sign INPUT.pdf -u NAME [options]
 | `--tsa URL` | Time-stamping authority (default `http://tsa.izenpe.com`) |
 | `--tsa-user USER`, `--tsa-password-file F`, `--tsa-policy OID` | Authenticated TSA (credentials are only sent over https) |
 | `--pdf-password-file F` | Password of an encrypted PDF |
-| `--password-file F` | Certificate password |
+| `--password-file F` | Certificate password (`.p12` users only) |
 | `--pkcs7` | `adbe.pkcs7.detached` instead of `ETSI.CAdES.detached` |
 | `--reserve BYTES` | Space reserved for the signature (rarely needed) |
-| `--dry-run` | Validate and describe, without signing or asking for passwords |
+| `--dry-run` | Validate and describe (including the `approval:` the signature will need), without signing or asking for passwords |
 
 Positions:
 - PAGE: `1`, `2`, …, `-1` (last), `first`, `last`, `all`.

@@ -100,6 +100,10 @@ jobs:
       - name: Smoke test
         run: scripts/smoke-test.sh dist/firma
 
+      - name: System certificate store test
+        if: runner.os != 'Linux'
+        run: scripts/system-cert-test.sh dist/firma
+
       # Archive names carry no version so that .../releases/latest/download/<name> always works
       # (the skill's install scripts rely on it).
       - name: Package

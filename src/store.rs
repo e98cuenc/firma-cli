@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! users/<name>/user.toml        metadata
-//! users/<name>/certificate.p12  certificate + private key (encrypted with its password)
+//! users/<name>/certificate.p12  certificate + private key (encrypted with its password), unless
+//!                               the certificate is in the system store (see `UserMeta::system_cert`)
 //! users/<name>/signature.png    handwritten signature as an image, or
 //! users/<name>/signature.pdf    vector handwritten signature (imported from Preview)
 //! ```
@@ -25,6 +26,20 @@ pub struct UserMeta {
     pub issuer: String,
     #[serde(default)]
     pub expires: String,
+    /// SHA-1 fingerprint of a certificate in the system store (macOS Keychain, Windows
+    /// certificate store). When set there is no `certificate.p12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_cert: Option<String>,
+    /// Whether to ask for Touch ID / Windows Hello before each signature with a system
+    /// certificate (default: yes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_check: Option<bool>,
+}
+
+impl UserMeta {
+    pub fn presence_check(&self) -> bool {
+        self.presence_check.unwrap_or(true)
+    }
 }
 
 /// Global preferences (`config.toml` in the data directory).
