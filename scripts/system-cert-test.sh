@@ -11,6 +11,8 @@ FIRMA="$(cd "$(dirname "$FIRMA")" && pwd)/$(basename "$FIRMA")"
 WORK="$(mktemp -d)"
 export MSYS_NO_PATHCONV=1 FIRMA_HOME="$WORK/home" FIRMA_TEST_SYSTEM_CERT="Firma System Test"
 PY="$(command -v python3 || command -v python)"
+# Windows Python needs Windows paths (MSYS_NO_PATHCONV stops Git Bash from converting them).
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi; }
 
 # macOS `security import` only reads PKCS#12 files with the legacy algorithms.
 legacy=()
@@ -18,7 +20,7 @@ if [ "$(uname -s)" = Darwin ] && openssl version | grep -q "^OpenSSL 3"; then le
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/u.key" -out "$WORK/u.crt" -days 2 \
   -subj "/CN=$FIRMA_TEST_SYSTEM_CERT" 2>/dev/null
 openssl pkcs12 -export ${legacy[@]+"${legacy[@]}"} -inkey "$WORK/u.key" -in "$WORK/u.crt" -out "$WORK/u.p12" -passout pass:test
-"$PY" "$(dirname "$0")/test-pdf.py" "$WORK/doc.pdf"
+"$PY" "$(native "$(dirname "$0")/test-pdf.py")" "$(native "$WORK/doc.pdf")"
 
 case "$(uname -s)" in
   Darwin)
@@ -42,9 +44,10 @@ case "$(uname -s)" in
       "$FIRMA" certs | grep "$FIRMA_TEST_SYSTEM_CERT"
       rm -rf "$FIRMA_HOME"
       "$FIRMA" user add sys --system-cert "firma system test"
-      "$FIRMA" sign "$WORK/doc.pdf" -u sys --stamp --dry-run | grep "approval:.*Windows Hello"
+      doc="$(native "$WORK/doc.pdf")"
+      "$FIRMA" sign "$doc" -u sys --stamp --dry-run | grep "approval:.*Windows Hello"
       # Windows Hello is not set up on CI: the release binary must refuse to sign.
-      if "$FIRMA" sign "$WORK/doc.pdf" -u sys --stamp -o "$WORK/signed.pdf" 2>"$WORK/err.txt"; then
+      if "$FIRMA" sign "$doc" -u sys --stamp -o "$(native "$WORK/signed.pdf")" 2>"$WORK/err.txt"; then
         echo "signed without Windows Hello" >&2
         exit 1
       fi

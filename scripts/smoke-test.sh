@@ -13,6 +13,8 @@ trap 'rm -rf "$WORK"' EXIT
 export FIRMA_HOME="$WORK/home" FIRMA_PASSWORD=smoke-test
 export MSYS_NO_PATHCONV=1 # Git Bash on Windows: keep "/CN=..." from being rewritten as a path
 PY="$(command -v python3 || command -v python)"
+# Windows Python needs Windows paths (MSYS_NO_PATHCONV stops Git Bash from converting them).
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi; }
 
 cd "$WORK"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 -subj "/CN=Smoke CA" 2>/dev/null
@@ -20,7 +22,7 @@ openssl req -newkey rsa:2048 -nodes -keyout u.key -out u.csr -subj "/CN=Smoke Us
 openssl x509 -req -in u.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out u.crt -days 1 2>/dev/null
 openssl pkcs12 -export -inkey u.key -in u.crt -certfile ca.crt -out u.p12 -passout "pass:$FIRMA_PASSWORD"
 
-"$PY" "$SCRIPTS/test-pdf.py" doc.pdf
+"$PY" "$(native "$SCRIPTS/test-pdf.py")" doc.pdf
 
 "$FIRMA" --version
 "$FIRMA" user add smoke --cert u.p12
