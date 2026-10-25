@@ -150,7 +150,25 @@ firma sign contract.pdf -u ana --at 1:120,40:70x30 --stamp-at 1:top-right \
   permissions are respected (adding annotations must be allowed). If the PDF needs a password to open, it is
   prompted, or read from `$FIRMA_PDF_PASSWORD` or `--pdf-password-file`.
 
-All boxes belong to a single signature. The PDF is modified through an incremental update, so existing
+### Several signatures on one document
+
+Each `firma sign` adds one signature in an incremental update, so the document can be signed again, by the same
+person or by others, and earlier signatures stay valid:
+
+```sh
+firma sign contract.pdf -u ana --at last:20,40:60x25 -o contract_ana.pdf
+firma sign contract_ana.pdf -u luis --at last:110,40:60x25 -o contract_signed.pdf
+```
+
+- `--dry-run` lists the signatures already there, with their boxes in the same `X,Y:WxH` form `--at` takes, so a
+  free spot is easy to pick. A box that would cover an earlier signature is refused (`--allow-overlap` allows it).
+- If the PDF was prepared with empty signature fields (e.g. "Applicant's signature"), the dry run lists them and
+  `--field NAME` signs into one: its box gets the handwritten signature (or the stamp, with `--stamp` or if the user
+  has none).
+- A document **certified** by its author is respected: "no changes" forbids any signature, and "form filling and
+  signing" only allows signing its existing fields with `--field`.
+
+All boxes of one `firma sign` belong to a single signature. The PDF is modified through an incremental update, so existing
 signatures stay valid. The format is PAdES (`ETSI.CAdES.detached`, with signing-certificate-v2).
 `--pkcs7` uses `adbe.pkcs7.detached` instead. RSA, EC P-256 and EC P-384 keys are supported, as are both
 modern (AES) and legacy (3DES/RC2) PKCS#12 files.

@@ -45,6 +45,8 @@ firma sign INPUT.pdf -u NAME [options]
 | `--level b\|t\|lt\|lta` | PAdES level (default from `firma config`, else `b`) |
 | `--tsa URL` | Time-stamping authority (default `http://tsa.izenpe.com`) |
 | `--tsa-user USER`, `--tsa-password-file F`, `--tsa-policy OID` | Authenticated TSA (credentials are only sent over https) |
+| `--field NAME` | Sign into this existing empty signature field (listed by `--dry-run`) instead of `--at` boxes |
+| `--allow-overlap` | Allow boxes on top of earlier signatures (refused by default) |
 | `--pdf-password-file F` | Password of an encrypted PDF |
 | `--password-file F` | Certificate password (`.p12` users only) |
 | `--pkcs7` | `adbe.pkcs7.detached` instead of `ETSI.CAdES.detached` |
@@ -56,6 +58,10 @@ Positions:
 - POS: `bottom-right`, `bottom-left`, `bottom-center`, `top-right`, `top-left`, `top-center`, `center`, or
   `X,Y` in mm from the bottom-left corner of the page as displayed (rotated pages are handled).
 - Default sizes: 60x25 mm for `--at`, 80x18 mm for `--stamp-at`.
+
+Several signatures: run `firma sign` again on the signed output, once per signer (or per signature). Earlier
+signatures stay valid. `--dry-run` lists them (`signed:` lines, with boxes as `page N at X,Y:WxH`), the empty fields
+(`empty field:`), and whether the author certified the document.
 
 Levels:
 

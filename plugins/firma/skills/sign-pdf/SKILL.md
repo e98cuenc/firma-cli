@@ -81,6 +81,10 @@ Gather from the request, asking only for what is missing:
   - "Initial every page": `--at all:bottom-right:35x15`.
   - "Like AutoFirma": add `--stamp`.
   - "With a time-stamp" or "long-term": `--level t` or `--level lta`.
+  - "Ana and Luis both sign": one `firma sign` per signer, the second on the first's output, each confirmed and
+    approved separately. Run the dry run on the current file so its `signed:` lines show where earlier
+    signatures are, and pick a free spot.
+  - The PDF has signature fields ("empty field:" in the dry run): prefer `--field NAME` for the matching signer.
 - `t`, `lt` and `lta` need network access, to reach the TSA and the OCSP/CRL servers.
 
 See `references/cli.md` for every option.
@@ -136,3 +140,5 @@ check the signature in Adobe Acrobat/Reader or at https://valide.redsara.es.
 | `is REVOKED` | Do not retry. The certificate is revoked; tell the user |
 | `incomplete certificate chain` / revocation errors | Retry with `--level t`, or check the network |
 | `already exists` | Choose another `-o`, or confirm with the user before adding `--force` |
+| `would cover existing signature boxes` | Pick a free spot (see the `signed:` lines of the dry run); use `--allow-overlap` only if the user asks |
+| `certified this document` | Respect it: "no changes" cannot be signed; otherwise sign into an existing field with `--field` |

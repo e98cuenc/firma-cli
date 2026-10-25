@@ -9,6 +9,7 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFo
 
 use super::write::{real, Body};
 use super::source::Source;
+use super::fields::{self, SigField};
 use super::{form_extent, page_box, page_rotation, resolve, text, Importer};
 use crate::cert::{Credential, Digest};
 
@@ -118,6 +119,10 @@ pub struct SignOptions {
     pub subfilter: SubFilter,
     pub reserve: usize,
     pub date: chrono::DateTime<chrono::Local>,
+    /// Sign into this existing empty signature field instead of adding a new one.
+    pub field: Option<String>,
+    /// Allow new boxes on top of existing signature fields.
+    pub allow_overlap: bool,
 }
 
 pub const DEFAULT_SIGNATURE_SIZE: (f64, f64) = (60.0, 25.0);
@@ -132,6 +137,8 @@ struct Widget {
     size: (f64, f64),
     with_graphic: bool,
     with_text: bool,
+    /// Widget of an existing field being signed (`--field`); `None` for a new one.
+    existing: Option<ObjectId>,
 }
 
 /// Handwritten-signature graphic already added to the update.
@@ -230,6 +237,16 @@ impl<'s, 'a> Update<'s, 'a> {
             }
         }
 
+        self.update_acroform(Some(field_id))
+    }
+
+    /// Marks the document as signed in the /AcroForm (for a field that is already in it).
+    fn set_sig_flags(&mut self) -> Result<()> {
+        self.update_acroform(None)
+    }
+
+    fn update_acroform(&mut self, new_field: Option<ObjectId>) -> Result<()> {
+        let doc = &self.src.doc;
         let root_id = self.src.root_id()?;
         let catalog = doc.get_dictionary(root_id)?.clone();
         let (acroform_id, mut acroform) = match catalog.get(b"AcroForm") {
@@ -237,9 +254,12 @@ impl<'s, 'a> Update<'s, 'a> {
             Ok(Object::Dictionary(d)) => (None, d.clone()),
             _ => (None, Dictionary::new()),
         };
-        let mut fields = acroform.get(b"Fields").map(|f| resolve(doc, f)).and_then(Object::as_array).cloned().unwrap_or_default();
-        fields.push(Object::Reference(field_id));
-        acroform.set("Fields", fields);
+        if let Some(field_id) = new_field {
+            let mut fields =
+                acroform.get(b"Fields").map(|f| resolve(doc, f)).and_then(Object::as_array).cloned().unwrap_or_default();
+            fields.push(Object::Reference(field_id));
+            acroform.set("Fields", fields);
+        }
         acroform.set("SigFlags", 3);
         match acroform_id {
             Some(id) => self.push(id, Object::Dictionary(acroform)),
@@ -307,19 +327,55 @@ pub fn sign_pdf(
     if pages.is_empty() {
         bail!("the PDF has no pages");
     }
+    check_certification(doc, root_id, opts.field.is_some())?;
+    let existing = fields::signature_fields(doc, root_id);
     let mut up = Update::new(&src)?;
 
     // --- Visible boxes ---
     let mut widgets = Vec::new();
     let has_text = opts.stamp_text.is_some();
+    let target = match &opts.field {
+        Some(name) => {
+            if !opts.placements.is_empty() || !opts.stamp_placements.is_empty() {
+                bail!("--field places the signature in that field; it cannot be combined with --at or --stamp-at");
+            }
+            Some(empty_field(&existing, name)?)
+        }
+        None => {
+            let report = overlap_report(doc, root_id, &opts.placements, &opts.stamp_placements)?;
+            if !report.is_empty() && !opts.allow_overlap {
+                bail!(
+                    "the new signature would cover existing signature boxes:\n  {}\nmove it (the dry run shows where they are) or pass --allow-overlap",
+                    report.join("\n  ")
+                );
+            }
+            None
+        }
+    };
+    if let Some(f) = target {
+        for w in &f.widgets {
+            let (rw, rh) = (w.rect[2] - w.rect[0], w.rect[3] - w.rect[1]);
+            let size = if w.rotate % 180 == 90 { (rh, rw) } else { (rw, rh) };
+            widgets.push(Widget {
+                page: w.page,
+                rect: w.rect,
+                rotate: w.rotate,
+                size,
+                with_graphic: graphic.is_some(),
+                with_text: has_text,
+                existing: Some(w.id),
+            });
+        }
+    }
     for p in &opts.placements {
         for (page, rect, rotate, size) in resolve_placement(doc, &pages, p, DEFAULT_SIGNATURE_SIZE)? {
-            widgets.push(Widget { page, rect, rotate, size, with_graphic: graphic.is_some(), with_text: has_text });
+            let with_graphic = graphic.is_some();
+            widgets.push(Widget { page, rect, rotate, size, with_graphic, with_text: has_text, existing: None });
         }
     }
     for p in &opts.stamp_placements {
         for (page, rect, rotate, size) in resolve_placement(doc, &pages, p, DEFAULT_STAMP_SIZE)? {
-            widgets.push(Widget { page, rect, rotate, size, with_graphic: false, with_text: true });
+            widgets.push(Widget { page, rect, rotate, size, with_graphic: false, with_text: true, existing: None });
         }
     }
 
@@ -343,6 +399,28 @@ pub fn sign_pdf(
 
     // --- Appearances and annotations ---
     let sig_id = up.alloc();
+    if let Some(f) = target {
+        // Existing field: give its widgets an appearance and the field its value.
+        for w in &widgets {
+            let ap_id = up.alloc();
+            let graphic = if w.with_graphic { graphic.as_ref() } else { None };
+            up.push(ap_id, appearance(w.size.0, w.size.1, w.rotate, graphic, opts.stamp_text.as_deref(), font_id));
+            let id = w.existing.expect("field widget");
+            let mut d = doc.get_dictionary(id)?.clone();
+            d.set("AP", dictionary! { "N" => ap_id });
+            if id == f.id {
+                d.set("V", sig_id);
+            }
+            up.push(id, Object::Dictionary(d));
+        }
+        if !f.widgets.iter().any(|w| w.id == f.id) {
+            let mut d = doc.get_dictionary(f.id)?.clone();
+            d.set("V", sig_id);
+            up.push(f.id, Object::Dictionary(d));
+        }
+        up.set_sig_flags()?;
+        return finish_signature(&src, up, sig_id, cred, opts, timestamp);
+    }
     let field_id = up.alloc();
     let field_name = unique_field_name(doc, root_id);
     let mut widget_ids = Vec::new();
@@ -392,8 +470,18 @@ pub fn sign_pdf(
         }
     }
     up.add_field(field_id, &annots_by_page)?;
+    finish_signature(&src, up, sig_id, cred, opts, timestamp)
+}
 
-    // --- Signature dictionary (strings encrypted if the PDF is) ---
+/// Writes the signature dictionary (strings encrypted if the PDF is) and signs.
+fn finish_signature(
+    src: &Source,
+    up: Update,
+    sig_id: ObjectId,
+    cred: &Credential,
+    opts: &SignOptions,
+    timestamp: Option<Timestamper>,
+) -> Result<Signed> {
     let info = cred.info();
     let mut head = Vec::new();
     head.extend_from_slice(b"<</Type/Sig/Filter/Adobe.PPKLite/SubFilter");
@@ -758,4 +846,98 @@ pub fn preview_boxes(doc: &Document, placements: &[Placement], default_size: (f6
         }
     }
     Ok(out)
+}
+
+/// Refuses to sign when the author's certification (DocMDP) forbids it. `into_field`: the
+/// signature goes into an existing field, which "form filling and signing" allows.
+pub fn check_certification(doc: &Document, root: ObjectId, into_field: bool) -> Result<()> {
+    match fields::certification(doc, root) {
+        Some(1) => bail!(
+            "the author certified this document with \"no changes allowed\": any new signature would invalidate \
+             that certification"
+        ),
+        Some(2) if !into_field => bail!(
+            "the author certified this document to allow only filling in its form and signing its existing \
+             signature fields: sign into one with --field NAME (the dry run lists them)"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The empty signature field called `name` (exact, else ignoring case).
+pub fn empty_field<'f>(existing: &'f [SigField], name: &str) -> Result<&'f SigField> {
+    let field = existing
+        .iter()
+        .find(|f| f.name == name)
+        .or_else(|| existing.iter().find(|f| f.name.eq_ignore_ascii_case(name)));
+    let Some(field) = field else {
+        let empty: Vec<&str> = existing.iter().filter(|f| !f.signed).map(|f| f.name.as_str()).collect();
+        if empty.is_empty() {
+            bail!("there is no signature field '{name}', and the document has no empty ones");
+        }
+        bail!("there is no signature field '{name}'; empty ones: {}", empty.join(", "));
+    };
+    if field.signed {
+        bail!("the field '{}' is already signed{}", field.name, field.signer.as_ref().map(|s| format!(" by {s}")).unwrap_or_default());
+    }
+    Ok(field)
+}
+
+/// The requested boxes that would cover an existing signature field, one line each.
+pub fn overlap_report(
+    doc: &Document,
+    root: ObjectId,
+    placements: &[Placement],
+    stamp_placements: &[Placement],
+) -> Result<Vec<String>> {
+    let pages = doc.get_pages();
+    let existing = fields::signature_fields(doc, root);
+    let mut boxes = Vec::new();
+    for p in placements {
+        boxes.extend(resolve_placement(doc, &pages, p, DEFAULT_SIGNATURE_SIZE)?);
+    }
+    for p in stamp_placements {
+        boxes.extend(resolve_placement(doc, &pages, p, DEFAULT_STAMP_SIZE)?);
+    }
+    let mut out = Vec::new();
+    for (page, r, _, _) in boxes {
+        for f in &existing {
+            for w in f.widgets.iter().filter(|w| w.page == page) {
+                let ix = r[2].min(w.rect[2]) - r[0].max(w.rect[0]);
+                let iy = r[3].min(w.rect[3]) - r[1].max(w.rect[1]);
+                if ix > 0.5 && iy > 0.5 {
+                    let who = match (&f.signer, f.signed) {
+                        (Some(s), _) => format!("signed by {s}"),
+                        (None, true) => "signed".to_string(),
+                        (None, false) => "empty field".to_string(),
+                    };
+                    let [x, y, bw, bh] = displayed_mm(doc, page, w.rect);
+                    let line = format!("page {}: {} ({who}) at {x:.0},{y:.0}:{bw:.0}x{bh:.0}", w.page_num, f.name);
+                    if !out.contains(&line) {
+                        out.push(line);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A /Rect as `--at` would describe it: x, y, width, height in mm, on the page as displayed.
+pub fn displayed_mm(doc: &Document, page: ObjectId, rect: [f64; 4]) -> [f64; 4] {
+    let b = page_box(doc, page);
+    let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
+    // Inverse of resolve_placement's to_user.
+    let to_display = |ux: f64, uy: f64| {
+        let (ux, uy) = (ux - b[0], uy - b[1]);
+        match page_rotation(doc, page) {
+            90 => (uy, bw - ux),
+            180 => (bw - ux, bh - uy),
+            270 => (bh - uy, ux),
+            _ => (ux, uy),
+        }
+    };
+    let (ax, ay) = to_display(rect[0], rect[1]);
+    let (cx, cy) = to_display(rect[2], rect[3]);
+    [ax.min(cx) / MM, ay.min(cy) / MM, (ax - cx).abs() / MM, (ay - cy).abs() / MM]
 }

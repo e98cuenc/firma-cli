@@ -205,6 +205,13 @@ struct SignArgs {
     /// Boxes with only the text stamp (implies --stamp); repeatable
     #[arg(long, value_name = "POS")]
     stamp_at: Vec<Placement>,
+    /// Sign into this existing empty signature field of the PDF (see the dry run) instead of
+    /// adding new boxes. Its box gets the handwritten signature, or the stamp if there is none
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["at", "stamp_at"])]
+    field: Option<String>,
+    /// Allow boxes on top of existing signature boxes (which would hide them)
+    #[arg(long)]
+    allow_overlap: bool,
     /// Stamp text. Variables: {name} {id} {issuer} {date} {time} {reason} {location}
     #[arg(long, value_name = "TEMPLATE")]
     text: Option<String>,
@@ -617,12 +624,13 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     }
 
     let signature = user.signature();
-    let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some();
+    // A field with no handwritten signature to put in it shows the stamp.
+    let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some() || (a.field.is_some() && signature.is_none());
     if !a.at.is_empty() && signature.is_none() && !stamp {
         bail!("user '{}' has no handwritten signature; add one with `firma user signature` or use --stamp", a.user);
     }
     let mut stamp_at = a.stamp_at.clone();
-    if stamp && a.at.is_empty() && stamp_at.is_empty() {
+    if stamp && a.at.is_empty() && stamp_at.is_empty() && a.field.is_none() {
         stamp_at.push("last:bottom-left".parse()?);
     }
 
@@ -659,6 +667,8 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         subfilter: if a.pkcs7 { SubFilter::Pkcs7 } else { SubFilter::Pades },
         reserve: a.reserve.unwrap_or(if level >= Level::T { 65536 } else { 16384 }),
         date,
+        field: a.field.clone(),
+        allow_overlap: a.allow_overlap,
     };
     let graphic = signature.as_ref().map(|(k, p)| match k {
         SignatureKind::Image => GraphicSource::Image(p),
@@ -749,12 +759,13 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
         (None, None) => Level::B,
     };
     let signature = user.signature();
-    let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some();
+    // A field with no handwritten signature to put in it shows the stamp.
+    let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some() || (a.field.is_some() && signature.is_none());
     if !a.at.is_empty() && signature.is_none() && !stamp {
         bail!("user '{}' has no handwritten signature; add one with `firma user signature` or use --stamp", a.user);
     }
     let mut stamp_at = a.stamp_at.clone();
-    if stamp && a.at.is_empty() && stamp_at.is_empty() {
+    if stamp && a.at.is_empty() && stamp_at.is_empty() && a.field.is_none() {
         stamp_at.push("last:bottom-left".parse()?);
     }
 
@@ -788,6 +799,55 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
         src.doc.get_pages().len(),
         if src.doc.encryption_state.is_some() { ", encrypted" } else { "" }
     );
+    // What is already there: earlier signatures, empty fields, the author's certification.
+    let root = src.root_id()?;
+    let existing = pdf::fields::signature_fields(&src.doc, root);
+    let place = |f: &pdf::fields::SigField| {
+        let boxes: Vec<String> = f
+            .widgets
+            .iter()
+            .map(|w| {
+                let [x, y, bw, bh] = pdf::sign::displayed_mm(&src.doc, w.page, w.rect);
+                format!("page {} at {x:.0},{y:.0}:{bw:.0}x{bh:.0}", w.page_num)
+            })
+            .collect();
+        if boxes.is_empty() { "invisible".to_string() } else { boxes.join("; ") }
+    };
+    if let Some(p) = pdf::fields::certification(&src.doc, root) {
+        let what = match p {
+            1 => "no changes allowed",
+            2 => "only form filling and signing its existing fields",
+            _ => "form filling, signing and annotations allowed",
+        };
+        println!("  certified:   by its author ({what})");
+    }
+    for f in &existing {
+        if f.timestamp {
+            println!("  time-stamp:  {} ({})", f.name, place(f));
+        } else if f.signed {
+            let by = f.signer.as_ref().map(|s| format!(" by {s}")).unwrap_or_default();
+            println!("  signed:      {}{by} ({})", f.name, place(f));
+        } else {
+            println!("  empty field: {} ({}); sign into it with --field \"{}\"", f.name, place(f), f.name);
+        }
+    }
+    pdf::sign::check_certification(&src.doc, root, a.field.is_some())?;
+    if let Some(name) = &a.field {
+        let f = pdf::sign::empty_field(&existing, name)?;
+        println!("  into field:  {} ({})", f.name, place(f));
+    } else {
+        let report = pdf::sign::overlap_report(&src.doc, root, &a.at, &stamp_at)?;
+        if !report.is_empty() {
+            if !a.allow_overlap {
+                bail!(
+                    "the new signature would cover existing signature boxes:\n  {}\nmove it or pass --allow-overlap",
+                    report.join("\n  ")
+                );
+            }
+            println!("  overlaps:    {} (--allow-overlap)", report.join("; "));
+        }
+    }
+
     let describe = |label: &str, boxes: Vec<pdf::sign::BoxPreview>| {
         for (page, rotate, (w, h)) in boxes {
             let rot = if rotate != 0 { format!(" (page rotated {rotate}°)") } else { String::new() };
@@ -796,7 +856,7 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
     };
     describe("signature:", pdf::sign::preview_boxes(&src.doc, &a.at, pdf::sign::DEFAULT_SIGNATURE_SIZE)?);
     describe("stamp:", pdf::sign::preview_boxes(&src.doc, &stamp_at, pdf::sign::DEFAULT_STAMP_SIZE)?);
-    if a.at.is_empty() && stamp_at.is_empty() {
+    if a.at.is_empty() && stamp_at.is_empty() && a.field.is_none() {
         println!("  visible:     no (invisible signature)");
     }
     if stamp {

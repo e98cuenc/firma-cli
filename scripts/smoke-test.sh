@@ -32,4 +32,12 @@ openssl pkcs12 -export -inkey u.key -in u.crt -certfile ca.crt -out u.p12 -passo
 grep -aq "/ETSI.CAdES.detached" signed.pdf
 grep -aq "/ByteRange" signed.pdf
 grep -aq "/Matrix" signed.pdf # appearance rotated for the /Rotate 90 page
+
+# A second signature on the same document: listed by the dry run, and not allowed on top of the first.
+"$FIRMA" sign signed.pdf -u smoke -o signed2.pdf --stamp-at 1:20,150:50x20
+[ "$("$FIRMA" sign signed2.pdf -u smoke --dry-run | grep -c "signed: ")" = 2 ]
+if "$FIRMA" sign signed2.pdf -u smoke -o signed3.pdf --stamp-at 1:30,160:50x20 2>/dev/null; then
+  echo "signed on top of an existing signature" >&2
+  exit 1
+fi
 echo "OK: signed.pdf created ($(wc -c < signed.pdf) bytes)"
