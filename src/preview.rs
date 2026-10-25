@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 
-use crate::pdf::{form_extent, resolve, Importer};
+use crate::pdf::{bounds, form_extent, resolve, Importer};
 
 pub struct Candidate {
     pub page: u32,
@@ -84,7 +84,7 @@ pub fn extract(pdf: &[u8], index: Option<usize>) -> Result<Vec<u8>> {
     build_signature_pdf(&src, chosen.form, chosen.extent)
 }
 
-fn build_signature_pdf(src: &Document, form: ObjectId, e: [f64; 4]) -> Result<Vec<u8>> {
+fn build_signature_pdf(src: &Document, form: ObjectId, mut e: [f64; 4]) -> Result<Vec<u8>> {
     let mut doc = Document::with_version("1.7");
     let mut next = 1u32;
     let mut imp = Importer::new(src, &mut next);
@@ -93,6 +93,15 @@ fn build_signature_pdf(src: &Document, form: ObjectId, e: [f64; 4]) -> Result<Ve
         doc.objects.insert(id, obj);
     }
     doc.max_id = next - 1;
+
+    // Trim the empty margins: the box becomes exactly the ink, so that --at X,Y:WxH places
+    // the visible strokes, not an invisible frame around them.
+    let ink = src.get_object(form).and_then(Object::as_stream).ok().and_then(|f| bounds::ink_bounds(src, f));
+    if let Some(ink) = ink {
+        let imported = doc.get_object_mut(form_id).and_then(Object::as_stream_mut)?;
+        imported.dict.set("BBox", ink.iter().map(|v| Object::Real(*v as f32)).collect::<Vec<_>>());
+        e = form_extent(&doc, &doc.get_object(form_id)?.as_stream()?.dict).unwrap_or(e);
+    }
 
     let (w, h) = (e[2] - e[0], e[3] - e[1]);
     let content = format!("q 1 0 0 1 {} {} cm /Signature Do Q", -e[0], -e[1]);

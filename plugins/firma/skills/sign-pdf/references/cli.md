@@ -16,7 +16,10 @@ firma user info NAME
 firma user remove NAME [--yes]                       # alias: rm; deletes the certificate copy
 ```
 
-- `--image` takes a PNG or JPEG. `--remove-background` makes white transparent, and the image is cropped to its content.
+- `--image` takes a PNG or JPEG. `--remove-background` makes white transparent.
+- Saved signatures (images and Preview's vector ones) are trimmed to the ink, with no empty margins. So an `--at`
+  box is filled by the strokes themselves; the signature keeps its proportions and is centred, so it fills the box
+  exactly when the box has the same proportions.
 - `--preview` (macOS only, interactive): opens a template in Preview. The user places their saved signature,
   saves with ⌘S and presses Enter. The signature is imported as vector graphics.
 - `--from-pdf`: imports a signature annotation from a PDF the user signed in Preview.

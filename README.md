@@ -111,6 +111,10 @@ firma user cert ana --system-cert 8B59669F      # move an existing user to it (d
   not against malware running as you.)
 - Linux has no such store: use `.p12` files there.
 
+Saved signatures are trimmed to the ink: white or transparent margins of an image, and the empty space around
+a vector signature, are removed. A box given with `--at PAGE:X,Y:WxH` is therefore filled by the strokes
+themselves (keeping their proportions, centred).
+
 ### Signature from Preview
 
 macOS keeps Preview's signatures in a private AnnotationKit keychain that only Apple apps can read, so they

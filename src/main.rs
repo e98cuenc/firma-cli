@@ -550,10 +550,12 @@ fn import_image(path: &Path, remove_bg: bool) -> Result<Vec<u8>> {
             px.0[3] = (a as f32 * keep) as u8;
         }
     }
+    // Crop to the ink: transparent and near-white pixels (paper) are margin.
     let (w, h) = img.dimensions();
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
     for (x, y, px) in img.enumerate_pixels() {
-        if px.0[3] > 8 {
+        let [r, g, b, a] = px.0;
+        if a > 8 && r.min(g).min(b) < 245 {
             x0 = x0.min(x);
             y0 = y0.min(y);
             x1 = x1.max(x);
@@ -561,7 +563,7 @@ fn import_image(path: &Path, remove_bg: bool) -> Result<Vec<u8>> {
         }
     }
     if x1 < x0 {
-        bail!("the image is empty (fully transparent)");
+        bail!("the image is empty (no ink, only a transparent or white background)");
     }
     let img = image::imageops::crop_imm(&img, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image();
     let mut out = std::io::Cursor::new(Vec::new());
