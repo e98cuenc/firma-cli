@@ -49,6 +49,14 @@ jobs:
           - name: aarch64-linux
             os: ubuntu-24.04-arm
             targets: aarch64-unknown-linux-musl
+          # Dynamically linked against glibc, so that PKCS#11 modules (smart cards such as the DNIe)
+          # can be loaded. Built on Ubuntu 22.04: runs on glibc 2.35 or newer.
+          - name: x86_64-linux-gnu
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - name: aarch64-linux-gnu
+            os: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
           - name: x86_64-windows
             os: windows-latest
             targets: x86_64-pc-windows-msvc
@@ -68,7 +76,7 @@ jobs:
           key: ${{ matrix.name }}
 
       - name: Install musl tools
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && contains(matrix.targets, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
@@ -103,6 +111,19 @@ jobs:
       - name: System certificate store test
         if: runner.os != 'Linux'
         run: scripts/system-cert-test.sh dist/firma
+
+      # SoftHSM stands in for a smart card. Not for the static musl builds: they cannot load modules.
+      - name: PKCS#11 token test
+        if: runner.os == 'macOS'
+        run: |
+          brew install softhsm opensc
+          scripts/pkcs11-test.sh dist/firma
+
+      - name: PKCS#11 token test
+        if: runner.os == 'Linux' && contains(matrix.targets, 'gnu')
+        run: |
+          sudo apt-get update && sudo apt-get install -y softhsm2 opensc
+          scripts/pkcs11-test.sh dist/firma
 
       # Archive names carry no version so that .../releases/latest/download/<name> always works
       # (the skill's install scripts rely on it).

@@ -3,7 +3,7 @@ name = "firma"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
-description = "Command-line PAdES PDF signing, an alternative to AutoFirma"
+description = "Command-line electronic signatures (PAdES, CAdES, XAdES, FacturaE), an alternative to AutoFirma"
 
 [dependencies]
 anyhow = "1"
@@ -12,6 +12,7 @@ chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 cmpv2 = "0.2.0"
 cms = { version = "0.2.3", features = ["builder"] }
+cryptoki = "0.12.1"
 der = { version = "0.7", features = ["alloc", "oid"] }
 dirs = "6"
 ecdsa = { version = "0.16", features = ["der", "signing"] }
@@ -22,6 +23,7 @@ lopdf = { version = "~0.40", default-features = false }
 p12-keystore = "0.4.1"
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
+quick-xml = "0.42.0"
 rpassword = "7"
 rsa = { version = "0.9", features = ["sha2"] }
 serde = { version = "1", features = ["derive"] }

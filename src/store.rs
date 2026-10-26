@@ -6,6 +6,7 @@
 //! users/<name>/user.toml        metadata
 //! users/<name>/certificate.p12  certificate + private key (encrypted with its password), unless
 //!                               the certificate is in the system store (see `UserMeta::system_cert`)
+//!                               or on a PKCS#11 token (`UserMeta::pkcs11_cert`)
 //! users/<name>/signature.png    handwritten signature as an image, or
 //! users/<name>/signature.pdf    vector handwritten signature (imported from Preview)
 //! ```
@@ -30,6 +31,13 @@ pub struct UserMeta {
     /// certificate store). When set there is no `certificate.p12`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_cert: Option<String>,
+    /// SHA-1 fingerprint of a certificate on a PKCS#11 token (smart card such as the DNIe), with
+    /// `pkcs11_module`. When set there is no `certificate.p12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pkcs11_cert: Option<String>,
+    /// Path of the PKCS#11 module that reaches `pkcs11_cert`'s token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pkcs11_module: Option<String>,
     /// Whether to ask for Touch ID / Windows Hello before each signature with a system
     /// certificate (default: yes).
     #[serde(default, skip_serializing_if = "Option::is_none")]

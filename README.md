@@ -1,6 +1,6 @@
 # firma
 
-Command-line PAdES signing for PDFs — an alternative to Spain's AutoFirma.
+Command-line electronic signatures (PAdES for PDFs, CAdES, XAdES and FacturaE invoices), an alternative to Spain's AutoFirma.
 A single self-contained binary written in pure Rust: no Java, no OpenSSL, no external libraries
 (it only links against the operating system's own libraries).
 
@@ -9,6 +9,8 @@ A single self-contained binary written in pure Rust: no Java, no OpenSSL, no ext
   password is typed, the key never leaves the system, and each signature is approved with Touch ID / Windows Hello.
 - Visible signature in one or more places, on any page, including rotated pages.
 - AutoFirma-style text stamp ("Digitally signed by …") so anyone can see the document is signed.
+- Other files too: CAdES (`.csig`) for any file, enveloped XAdES for XML documents, and FacturaE electronic
+  invoices (XAdES-EPES with the FacturaE policy), at levels B-B and B-T.
 - PAdES B-B, B-T (RFC 3161 time-stamp), B-LT (embedded OCSP/CRL revocation data) and B-LTA
   (document time-stamp for long-term archival).
 - Signs encrypted PDFs (RC4, AES-128, AES-256), respecting their permissions.
@@ -48,11 +50,14 @@ cargo install --locked --path .        # installs into ~/.cargo/bin
 | Platform | Release artifact | Notes |
 |---|---|---|
 | macOS | `firma-macos-universal.tar.gz` | Universal binary (Apple Silicon + Intel) |
-| Linux | `firma-x86_64-linux.tar.gz`, `firma-aarch64-linux.tar.gz` | Fully static (musl) |
+| Linux | `firma-x86_64-linux.tar.gz`, `firma-aarch64-linux.tar.gz` | Fully static (musl): runs anywhere, but cannot use smart cards |
+| Linux | `firma-x86_64-linux-gnu.tar.gz`, `firma-aarch64-linux-gnu.tar.gz` | Linked against glibc 2.35+ (Ubuntu 22.04, Debian 12, Fedora 36 or newer): can use smart cards (PKCS#11) |
 | Windows | `firma-x86_64-windows.zip` | Static CRT, no Visual C++ runtime needed |
 
 Or use the installers, which check the release's SHA-256 sums:
 `plugins/firma/skills/sign-pdf/scripts/install.sh` (macOS/Linux, into `~/.local/bin`) or `install.ps1` (Windows).
+On Linux, `install.sh` picks the glibc build when the system has glibc 2.35 or newer, and the static one otherwise
+(`FIRMA_LINUX_BUILD=gnu` or `static` chooses).
 
 Release builds are produced by GitHub Actions (`.github/workflows/build.yml`) when a `v*` tag is pushed:
 
@@ -109,7 +114,32 @@ firma user cert ana --system-cert 8B59669F      # move an existing user to it (d
   `firma user presence-check ana off`, which itself asks for Touch ID / Windows Hello once. (A program that
   can edit your files could still change `user.toml`; the check protects against misuse of the command,
   not against malware running as you.)
-- Linux has no such store: use `.p12` files there.
+- Linux has no such store: use `.p12` files or a smart card (below) there.
+
+### Smart cards and tokens (PKCS#11): DNIe, USB tokens
+
+A certificate on a smart card (the Spanish **DNIe**, FNMT or Camerfirma cards), a USB token or an HSM is used
+through its PKCS#11 module, such as OpenSC's or the official DNIe module:
+
+```sh
+firma certs --pkcs11                            # certificates on the cards in the readers
+firma user add ana --pkcs11 12345678Z           # by ID, part of the holder's name, or SHA-1 fingerprint
+firma user add ana --pkcs11 8B59669F --pkcs11-module /usr/lib/libpkcs11-dnie.so
+firma sign contract.pdf -u ana                  # asks for the card's PIN
+```
+
+- The module is OpenSC's or the DNIe one if installed in the usual place, else `--pkcs11-module` or
+  `$FIRMA_PKCS11_MODULE`. It is saved with the user.
+- A DNIe holds two certificates for the same person: authentication and signing. A name or ID picks the
+  signing one (the one with the nonRepudiation key usage); `firma certs --pkcs11` shows which is which.
+- The key never leaves the card. The PIN is asked at each signature, in a prompt that names the document and
+  the signer (or read from `--password-file` / `$FIRMA_PASSWORD`), or typed on the reader's PIN pad if it has
+  one. Keys that require the PIN for every signature, like the DNIe's signing key, get it again right before
+  signing. A wrong PIN fails without retrying, and firma warns when the card is close to locking.
+- On macOS and Windows a card whose driver puts it in the Keychain / Windows certificate store (the DNIe
+  minidriver on Windows, for example) also works with `--system-cert`.
+- On Linux, use the `-linux-gnu` release builds (or `cargo install`): the fully static ones cannot load
+  PKCS#11 modules, as a static binary cannot load shared libraries.
 
 Saved signatures are trimmed to the ink: white or transparent margins of an image, and the empty space around
 a vector signature, are removed. A box given with `--at PAGE:X,Y:WxH` is therefore filled by the strokes
@@ -173,6 +203,30 @@ signatures stay valid. The format is PAdES (`ETSI.CAdES.detached`, with signing-
 `--pkcs7` uses `adbe.pkcs7.detached` instead. RSA, EC P-256 and EC P-384 keys are supported, as are both
 modern (AES) and legacy (3DES/RC2) PKCS#12 files.
 
+## Other formats: CAdES, XAdES and FacturaE
+
+`firma sign` picks the format from the file (`--format auto`, the default), or takes it from `--format`:
+
+```sh
+firma sign contract.docx -u ana                # CAdES → contract.docx.csig, the document inside it
+firma sign contract.docx -u ana --detached     # CAdES without the document (keep both files)
+firma sign data.xml -u ana                     # XAdES, enveloped → data_signed.xsig
+firma sign invoice.xml -u ana --level t        # FacturaE (root element Facturae) → invoice_signed.xsig
+```
+
+| Format | For | Signature |
+|---|---|---|
+| `pades` | PDFs | Inside the PDF (everything above) |
+| `cades` | Any file | CMS `SignedData` with signing-time and signing-certificate-v2; the file inside it (AutoFirma's default), or outside with `--detached` |
+| `xades` | XML documents | `ds:Signature` at the end of the root element, XAdES 1.3.2 with `SigningCertificateV2` and the document's MIME type. The document is digested with the enveloped-signature transform and C14N, so other signatures already in it stay valid |
+| `facturae` | FacturaE 3.x invoices | Like `xades`, plus the FacturaE signature policy v3.1 (XAdES-EPES), signer role `emisor` and `SigningCertificate` |
+
+- Levels `b` and `t` (a time-stamp over the signature, as in PAdES). `lt` and `lta` are for PDFs only: asking for them
+  is an error, and a configured default above `t` signs at `t` with a note.
+- The PDF options (`--at`, `--stamp`, `--field`, `--reason`, …) are refused for the other formats.
+- XML must be UTF-8 (or plain ASCII) and have no DTD (`<!DOCTYPE>`): firma never expands entities. A file that
+  starts with `<?xml` but cannot be read as XML is refused in `auto` mode; `--format cades` signs it as a file.
+
 ## Levels: time-stamps and revocation data
 
 ```sh
@@ -217,3 +271,6 @@ firma config --tsa http://timestamp.digicert.com
 - Revocation data is only fetched over http/https. LDAP CRL distribution points are skipped (most CAs
   also publish an http one).
 - Certificate-based PDF encryption (public-key security handler) is not supported, only passwords.
+- PKCS#11 tokens are tested with SoftHSM (RSA, EC and always-authenticate keys), not with a physical DNIe.
+- CAdES, XAdES and FacturaE stop at level B-T (no LT/LTA), and there is no co-signing of an existing CAdES file
+  or counter-signing. XAdES is enveloped only (no detached or enveloping XAdES).

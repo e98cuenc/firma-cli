@@ -19,6 +19,8 @@ pub enum Key {
     /// Held by the operating system (macOS Keychain, Windows certificate store): it never
     /// leaves it, the system signs for us.
     System(crate::keystore::SystemKey),
+    /// On a PKCS#11 token (smart card such as the DNIe, USB token, HSM), logged in with its PIN.
+    Token(crate::pkcs11::TokenKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +164,17 @@ impl Credential {
         Ok(Self { key: Key::System(key), cert, cert_der, chain_der })
     }
 
+    /// A certificate on a PKCS#11 token (`sha1` is its fingerprint); `pin` is asked for its PIN.
+    pub fn token(
+        module: &std::path::Path,
+        sha1: &str,
+        pin: impl FnOnce(&crate::pkcs11::PinRequest) -> Result<String>,
+    ) -> Result<Self> {
+        let (key, cert_der, chain_der) = crate::pkcs11::load(module, sha1, pin)?;
+        let cert = Certificate::from_der(&cert_der).map_err(|e| anyhow!("unreadable certificate: {e}"))?;
+        Ok(Self { key: Key::Token(key), cert, cert_der, chain_der })
+    }
+
     pub fn info(&self) -> CertInfo {
         cert_info(&self.cert)
     }
@@ -172,6 +185,7 @@ impl Credential {
             Key::P256(_) => KeyAlg::P256,
             Key::P384(_) => KeyAlg::P384,
             Key::System(k) => k.alg,
+            Key::Token(k) => k.alg,
         }
     }
 
@@ -206,16 +220,18 @@ impl Credential {
                 let sig: p384::ecdsa::Signature = sk.try_sign(data)?;
                 sig.to_der().as_bytes().to_vec()
             }
-            Key::System(k) => {
-                let sig = k.sign(&self.digest().hash(&[data]))?;
-                // The key is out of our sight: check it really belongs to the certificate.
-                let (oid, null) = self.signature_algorithm();
-                let alg = spki::AlgorithmIdentifierOwned { oid, parameters: null.then(der::Any::null) };
-                crate::verify::signature(&self.cert.tbs_certificate.subject_public_key_info, &alg, None, data, &sig)
-                    .context("the system's private key does not match the certificate")?;
-                sig
-            }
+            Key::System(k) => self.checked(data, k.sign(&self.digest().hash(&[data]))?, "system's")?,
+            Key::Token(k) => self.checked(data, k.sign(data, self.digest())?, "token's")?,
         })
+    }
+
+    /// The key is out of our sight: check it really belongs to the certificate.
+    fn checked(&self, data: &[u8], sig: Vec<u8>, whose: &str) -> Result<Vec<u8>> {
+        let (oid, null) = self.signature_algorithm();
+        let alg = spki::AlgorithmIdentifierOwned { oid, parameters: null.then(der::Any::null) };
+        crate::verify::signature(&self.cert.tbs_certificate.subject_public_key_info, &alg, None, data, &sig)
+            .with_context(|| format!("the {whose} private key does not match the certificate"))?;
+        Ok(sig)
     }
 }
 
@@ -254,7 +270,7 @@ fn public_key_bits(key: &Key) -> Result<Vec<u8>> {
         Key::Rsa(k) => k.to_public_key().to_public_key_der()?.into_vec(),
         Key::P256(k) => k.public_key().to_public_key_der()?.into_vec(),
         Key::P384(k) => k.public_key().to_public_key_der()?.into_vec(),
-        Key::System(_) => bail!("system keys are matched by the system"),
+        Key::System(_) | Key::Token(_) => bail!("system and token keys are matched by their certificate"),
     };
     let spki = spki::SubjectPublicKeyInfoRef::from_der(&spki_der).context("SPKI")?;
     Ok(spki.subject_public_key.raw_bytes().to_vec())

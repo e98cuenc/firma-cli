@@ -10,6 +10,11 @@ in the macOS Keychain / Windows certificate store). It can add
 a visible handwritten signature and an AutoFirma-style "Digitally signed by …" stamp, and supports the
 B-B, B-T, B-LT and B-LTA levels, including on encrypted PDFs.
 
+It can also sign other files, with the same rules below: XML documents (XAdES), FacturaE electronic invoices, and
+any other file (CAdES, `.csig`). `firma sign` picks the format from the file; the dry run shows which one
+(`level: XAdES B-B`, …). For those, only `--level b|t`, `--detached` (CAdES) and `-o` apply; the visible
+signature and stamp options are for PDFs only.
+
 A digital signature has legal effect on the user's behalf. Follow these rules every time:
 
 - **Only sign when the user explicitly asks you to sign a specific document.** Never sign as a side effect
@@ -18,6 +23,8 @@ A digital signature has legal effect on the user's behalf. Follow these rules ev
 - **Never handle passwords.** Do not ask for a certificate or PDF password in the chat, do not put one on a
   command line or in an environment variable you set, and do not read password files. If the user pastes a
   password in the chat anyway, do not repeat it or store it; tell them to consider changing it.
+  A smart card's PIN (DNIe and other cards, `firma user add --pkcs11`) is a password too: the user types it in
+  the prompt or on the reader, so for those users they run the final command themselves.
 - Never modify or delete the user's certificates, and never run `firma user remove` unless asked.
 - Never turn off the Touch ID / Windows Hello check (`firma user presence-check … off`, `--no-presence-check`)
   and never edit firma's files (`user.toml`, `config.toml`) yourself.

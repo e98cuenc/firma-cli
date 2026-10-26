@@ -539,6 +539,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cryptoki"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625cf4599c43d69a16996ce2573fc80745a0b0300c962f0bfa11d55b6cab2b2d"
+dependencies = [
+ "bitflags",
+ "cryptoki-sys",
+ "libloading",
+ "log",
+ "secrecy",
+]
+
+[[package]]
+name = "cryptoki-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1fd850498411e4057f1cba79e6e2bc7cbe960544c1046ab46d4685c403a1121"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "ctr"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +815,7 @@ dependencies = [
  "clap",
  "cmpv2",
  "cms 0.2.3",
+ "cryptoki",
  "der 0.7.10",
  "dirs",
  "ecdsa",
@@ -806,6 +829,7 @@ dependencies = [
  "p12-keystore",
  "p256",
  "p384",
+ "quick-xml",
  "rpassword",
  "rsa",
  "security-framework",
@@ -1199,6 +1223,16 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -1683,6 +1717,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1917,6 +1960,15 @@ dependencies = [
  "generic-array",
  "pkcs8 0.10.2",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
  "zeroize",
 ]
 

@@ -4,11 +4,14 @@ mod cms;
 mod keystore;
 mod net;
 mod pdf;
+mod pkcs11;
 mod preview;
 mod revocation;
 mod store;
 mod tsa;
 mod verify;
+mod xades;
+mod xml;
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -25,7 +28,7 @@ use store::{write_private, Config, SignatureKind, Store, User};
 const DEFAULT_TSA: &str = "http://tsa.izenpe.com";
 const DEFAULT_TEXT: &str = "Digitally signed by {name} on {date} at {time} with a certificate issued by {issuer}";
 
-/// Electronic signature of PDFs (PAdES) from the command line, an alternative to AutoFirma.
+/// Electronic signatures (PAdES, CAdES, XAdES, FacturaE) from the command line, an alternative to AutoFirma.
 #[derive(Parser)]
 #[command(name = "firma", version)]
 struct Cli {
@@ -41,10 +44,19 @@ enum Cmd {
     /// Manage users (certificate + handwritten signature)
     #[command(subcommand)]
     User(UserCmd),
-    /// Sign a PDF
+    /// Sign a PDF (PAdES), an XML document (XAdES), an electronic invoice (FacturaE) or any
+    /// other file (CAdES)
     Sign(Box<SignArgs>),
-    /// List the certificates with a private key in the macOS Keychain / Windows certificate store
-    Certs,
+    /// List the certificates with a private key in the macOS Keychain / Windows certificate store,
+    /// or with --pkcs11 those on smart cards and tokens (such as the DNIe)
+    Certs {
+        /// List the certificates on PKCS#11 tokens instead
+        #[arg(long)]
+        pkcs11: bool,
+        /// PKCS#11 module (default: $FIRMA_PKCS11_MODULE, or an installed OpenSC / DNIe module)
+        #[arg(long, value_name = "PATH", requires = "pkcs11")]
+        pkcs11_module: Option<PathBuf>,
+    },
     /// Show or change preferences (default PAdES level and TSA)
     Config {
         /// Default PAdES level
@@ -63,16 +75,16 @@ enum Cmd {
     },
 }
 
-/// PAdES signature level.
+/// Signature level.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 enum Level {
     /// B-B: basic signature
     B,
     /// B-T: with a signature time-stamp
     T,
-    /// B-LT: time-stamp plus embedded revocation data (OCSP/CRL)
+    /// B-LT: time-stamp plus embedded revocation data (OCSP/CRL); PDFs only
     Lt,
-    /// B-LTA: B-LT plus a document time-stamp for long-term archival
+    /// B-LTA: B-LT plus a document time-stamp for long-term archival; PDFs only
     Lta,
 }
 
@@ -81,23 +93,72 @@ impl Level {
         Level::from_str(s, true).map_err(|_| anyhow::anyhow!("invalid level '{s}' (b, t, lt or lta)"))
     }
 
-    fn name(self) -> &'static str {
+    fn name(self, format: Format) -> String {
+        let level = match self {
+            Level::B => "B-B",
+            Level::T => "B-T",
+            Level::Lt => "B-LT",
+            Level::Lta => "B-LTA",
+        };
+        match format {
+            Format::Facturae => format!("FacturaE, XAdES-EPES {level}"),
+            f => format!("{} {level}", f.label()),
+        }
+    }
+}
+
+/// Signature format.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum, Debug)]
+enum Format {
+    /// From the file: PAdES for PDFs, FacturaE for invoices, XAdES for other XML, CAdES otherwise
+    Auto,
+    /// Signature inside the PDF
+    Pades,
+    /// CMS signature file (.csig), with the signed file inside it unless --detached
+    Cades,
+    /// Enveloped signature inside the XML document
+    Xades,
+    /// Electronic invoice: XAdES-EPES with the FacturaE signature policy v3.1, role "emisor"
+    Facturae,
+}
+
+impl Format {
+    fn label(self) -> &'static str {
         match self {
-            Level::B => "PAdES B-B",
-            Level::T => "PAdES B-T",
-            Level::Lt => "PAdES B-LT",
-            Level::Lta => "PAdES B-LTA",
+            Format::Auto | Format::Pades => "PAdES",
+            Format::Cades => "CAdES",
+            Format::Xades => "XAdES",
+            Format::Facturae => "FacturaE",
+        }
+    }
+
+    /// The format `auto` stands for, from the file's content.
+    fn detect(input: &[u8]) -> Result<Format> {
+        if input.windows(5).take(1024).any(|w| w == b"%PDF-") {
+            return Ok(Format::Pades);
+        }
+        match xades::root(input) {
+            Ok(root) if xades::is_facturae(&root) => Ok(Format::Facturae),
+            Ok(_) => Ok(Format::Xades),
+            // Declared XML that cannot be signed as XML: say why rather than fall back to CAdES.
+            Err(e) if input.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(input).starts_with(b"<?xml") => {
+                Err(e.context("cannot sign it as XML; use --format cades to sign it as a file"))
+            }
+            Err(_) => Ok(Format::Cades),
         }
     }
 }
 
 #[derive(Subcommand)]
 enum UserCmd {
-    /// Add a user with their certificate (a .p12/.pfx file, or one in the system store)
+    /// Add a user with their certificate (a .p12/.pfx file, one in the system store, or one on a
+    /// smart card or token such as the DNIe)
     Add {
         name: String,
         #[command(flatten)]
         cert: CertArgs,
+        #[command(flatten)]
+        module: ModuleArgs,
         /// Do not ask for Touch ID / Windows Hello before each signature with a system certificate
         /// (asks for it once now, to confirm)
         #[arg(long, requires = "system_cert")]
@@ -118,6 +179,8 @@ enum UserCmd {
         name: String,
         #[command(flatten)]
         cert: CertArgs,
+        #[command(flatten)]
+        module: ModuleArgs,
         #[command(flatten)]
         password: PasswordArgs,
     },
@@ -155,6 +218,20 @@ struct CertArgs {
     /// part of the holder's name (see `firma certs`). The key stays there and no password is needed
     #[arg(long, value_name = "QUERY")]
     system_cert: Option<String>,
+    /// A certificate on a smart card or token (PKCS#11), such as the DNIe, by SHA-1 fingerprint or
+    /// part of the holder's name or ID (see `firma certs --pkcs11`). The key stays on the card and
+    /// its PIN is asked at each signature. For a DNIe, the signing certificate is preferred
+    #[arg(long, value_name = "QUERY")]
+    pkcs11: Option<String>,
+}
+
+/// Outside `CertArgs`, whose fields are all alternatives to each other.
+#[derive(Args)]
+struct ModuleArgs {
+    /// PKCS#11 module for --pkcs11 (default: $FIRMA_PKCS11_MODULE, or an installed OpenSC / DNIe
+    /// module); saved with the user
+    #[arg(long, value_name = "PATH", requires = "pkcs11")]
+    pkcs11_module: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -185,14 +262,21 @@ struct PasswordArgs {
 
 #[derive(Args)]
 struct SignArgs {
-    /// PDF to sign
+    /// File to sign
     input: PathBuf,
     /// User who signs
     #[arg(long, short = 'u')]
     user: String,
-    /// Output PDF (default: <input>_signed.pdf)
+    /// Output file (default: <input>_signed.pdf for PDFs, <input>.csig for CAdES,
+    /// <input>_signed.xsig for XAdES and FacturaE)
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
+    /// Signature format
+    #[arg(long, value_enum, default_value_t = Format::Auto)]
+    format: Format,
+    /// CAdES: leave the signed file out of the signature (it is needed to verify it)
+    #[arg(long)]
+    detached: bool,
     /// Where to put the visible signature; repeatable.
     /// Format PAGE:POSITION[:WIDTHxHEIGHT] (mm, origin at the bottom-left of the page as displayed).
     /// PAGE: 1, 2, -1, first, last, all. POSITION: X,Y or bottom-right, bottom-left,
@@ -227,8 +311,8 @@ struct SignArgs {
     /// Use adbe.pkcs7.detached instead of PAdES (ETSI.CAdES.detached)
     #[arg(long)]
     pkcs7: bool,
-    /// PAdES level: b, t (time-stamp), lt (+ revocation data) or lta (+ document time-stamp).
-    /// Default: from `firma config`, or b
+    /// Level: b, t (time-stamp), lt (+ revocation data) or lta (+ document time-stamp); lt and
+    /// lta are for PDFs only. Default: from `firma config`, or b
     #[arg(long, value_enum)]
     level: Option<Level>,
     /// Time-stamping authority (RFC 3161 URL); default: from `firma config`, $FIRMA_TSA, or Izenpe
@@ -272,7 +356,25 @@ fn run() -> Result<()> {
     match cli.cmd {
         Cmd::User(c) => user_cmd(&store, c),
         Cmd::Sign(a) => sign_cmd(&store, *a),
-        Cmd::Certs => {
+        Cmd::Certs { pkcs11: true, pkcs11_module } => {
+            let module = pkcs11::module(pkcs11_module.as_deref())?;
+            let certs = pkcs11::list(&module)?;
+            if certs.is_empty() {
+                println!("No certificates on any token seen by {} (is the card in the reader?)", module.display());
+            }
+            let users = store.list()?;
+            for c in certs {
+                let used: Vec<&str> = users
+                    .iter()
+                    .filter(|u| u.meta.pkcs11_cert.as_deref() == Some(c.id.sha1.as_str()))
+                    .map(|u| u.meta.name.as_str())
+                    .collect();
+                let used = if used.is_empty() { String::new() } else { format!("  [user {}]", used.join(", ")) };
+                println!("{}{used}", pkcs11::describe(&c));
+            }
+            Ok(())
+        }
+        Cmd::Certs { .. } => {
             let certs = keystore::list()?;
             if certs.is_empty() {
                 println!("No certificates with a private key in the {}.", keystore::STORE);
@@ -325,11 +427,11 @@ fn run() -> Result<()> {
 
 fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
     match cmd {
-        UserCmd::Add { name, cert, no_presence_check, signature, password } => {
+        UserCmd::Add { name, cert, module, no_presence_check, signature, password } => {
             if store.user(&name).is_ok() {
                 bail!("user '{name}' already exists");
             }
-            let source = cert_source(&cert, &password)?;
+            let source = cert_source(&cert, &module, &password)?;
             if no_presence_check {
                 confirm_presence_off(&name)?;
             }
@@ -357,15 +459,18 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
             }
             Ok(())
         }
-        UserCmd::Cert { name, cert, password } => {
+        UserCmd::Cert { name, cert, module, password } => {
             let mut user = store.user(&name)?;
-            let source = cert_source(&cert, &password)?;
+            let source = cert_source(&cert, &module, &password)?;
             set_cert(&mut user, source)?;
             print_user(&user);
             Ok(())
         }
         UserCmd::PresenceCheck { name, state } => {
             let mut user = store.user(&name)?;
+            if user.meta.pkcs11_cert.is_some() {
+                bail!("user '{name}' signs with a smart card or token, which is protected by its PIN instead");
+            }
             if user.meta.system_cert.is_none() {
                 bail!("user '{name}' uses a .p12 file, which is protected by its password instead");
             }
@@ -391,7 +496,13 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
                     Some((SignatureKind::Vector, _)) => "signature: vector",
                     None => "no signature",
                 };
-                let store = if u.meta.system_cert.is_some() { format!(", {}", keystore::STORE) } else { String::new() };
+                let store = if u.meta.system_cert.is_some() {
+                    format!(", {}", keystore::STORE)
+                } else if u.meta.pkcs11_cert.is_some() {
+                    ", smart card / token".to_string()
+                } else {
+                    String::new()
+                };
                 println!("{:<16} {}  (expires {}, {sig}{store})", u.meta.name, u.meta.holder, u.meta.expires);
             }
             Ok(())
@@ -402,9 +513,10 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
         }
         UserCmd::Remove { name, yes } => {
             let user = store.user(&name)?;
-            let what = match user.meta.system_cert {
-                Some(_) => format!("from {} (the certificate stays in the {})", user.dir.display(), keystore::STORE),
-                None => format!("and their certificate from {}", user.dir.display()),
+            let what = match (&user.meta.system_cert, &user.meta.pkcs11_cert) {
+                (Some(_), _) => format!("from {} (the certificate stays in the {})", user.dir.display(), keystore::STORE),
+                (_, Some(_)) => format!("from {} (the certificate stays on the card)", user.dir.display()),
+                _ => format!("and their certificate from {}", user.dir.display()),
             };
             if !yes && !confirm(&format!("Delete user '{name}' {what}? [y/N] "))? {
                 println!("Cancelled.");
@@ -421,14 +533,24 @@ fn user_cmd(store: &Store, cmd: UserCmd) -> Result<()> {
 enum CertSource {
     P12(Vec<u8>, cert::CertInfo),
     System(keystore::Identity),
+    Token(PathBuf, pkcs11::TokenCert),
 }
 
-fn cert_source(args: &CertArgs, password: &PasswordArgs) -> Result<CertSource> {
+fn cert_source(args: &CertArgs, module: &ModuleArgs, password: &PasswordArgs) -> Result<CertSource> {
     if let Some(query) = &args.system_cert {
         let id = keystore::find(query)?;
         // Make sure the key can be used (and its type is supported) before saving anything.
         Credential::system(&id.sha1)?;
         return Ok(CertSource::System(id));
+    }
+    if let Some(query) = &args.pkcs11 {
+        let module = pkcs11::module(module.pkcs11_module.as_deref())?;
+        let c = pkcs11::find(&module, query)?;
+        if !c.signing {
+            eprintln!("note: this certificate is not marked for signatures (nonRepudiation); validators may reject it");
+        }
+        // Checking the key itself needs the PIN: the first signature does it.
+        return Ok(CertSource::Token(module, c));
     }
     let path = args.cert.as_ref().expect("clap requires --cert or --system-cert");
     let p12 = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -443,7 +565,20 @@ fn set_cert(user: &mut User, source: CertSource) -> Result<()> {
             write_private(&user.cert_path(), &p12)?;
             user.meta.system_cert = None;
             user.meta.presence_check = None;
+            user.meta.pkcs11_cert = None;
+            user.meta.pkcs11_module = None;
             info
+        }
+        CertSource::Token(module, c) => {
+            if user.cert_path().exists() {
+                fs::remove_file(user.cert_path())?;
+                println!("Removed firma's copy of the .p12; the user now signs with the card.");
+            }
+            user.meta.system_cert = None;
+            user.meta.presence_check = None;
+            user.meta.pkcs11_cert = Some(c.id.sha1);
+            user.meta.pkcs11_module = Some(module.to_string_lossy().into_owned());
+            c.id.info
         }
         CertSource::System(id) => {
             // No copy of the certificate is kept: the system store has it.
@@ -457,10 +592,18 @@ fn set_cert(user: &mut User, source: CertSource) -> Result<()> {
                 println!("The {} check is on again for the new certificate.", keystore::PRESENCE);
             }
             user.meta.system_cert = Some(id.sha1);
+            user.meta.pkcs11_cert = None;
+            user.meta.pkcs11_module = None;
             id.info
         }
     };
     update_meta(user, &info)
+}
+
+/// The PKCS#11 module saved with a user who signs with a token.
+fn token_module(user: &User) -> Result<PathBuf> {
+    let module = user.meta.pkcs11_module.as_deref().context("the user has no PKCS#11 module; set it again with `firma user cert`")?;
+    Ok(PathBuf::from(module))
 }
 
 /// Turning off the presence check for a system certificate needs the user there, so that a
@@ -482,13 +625,18 @@ fn print_user(u: &User) {
     println!("  holder:      {}", u.meta.holder);
     println!("  issuer:      {}", u.meta.issuer);
     println!("  expires:     {}", u.meta.expires);
-    match &u.meta.system_cert {
-        Some(sha1) => {
+    match (&u.meta.system_cert, &u.meta.pkcs11_cert) {
+        (_, Some(sha1)) => {
+            println!("  certificate: smart card / token ({sha1})");
+            println!("  module:      {}", u.meta.pkcs11_module.as_deref().unwrap_or("(none)"));
+            println!("  approval:    the card's PIN, at each signature");
+        }
+        (Some(sha1), None) => {
             println!("  certificate: {} ({sha1})", keystore::STORE);
             let check = if u.meta.presence_check() { "before each signature" } else { "off" };
             println!("  {:<12} {check}", format!("{}:", keystore::PRESENCE));
         }
-        None => println!("  certificate: {}", u.cert_path().display()),
+        (None, None) => println!("  certificate: {}", u.cert_path().display()),
     }
     match u.signature() {
         Some((k, p)) => println!(
@@ -581,28 +729,59 @@ fn import_image(path: &Path, remove_bg: bool) -> Result<Vec<u8>> {
 fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
     let user = store.user(&a.user)?;
     let input = fs::read(&a.input).with_context(|| format!("reading {}", a.input.display()))?;
+    let format = match a.format {
+        Format::Auto => Format::detect(&input)?,
+        f => f,
+    };
+    check_format_args(format, &a)?;
     let output = a.output.clone().unwrap_or_else(|| {
+        let name = a.input.file_name().unwrap_or_default().to_string_lossy();
         let stem = a.input.file_stem().unwrap_or_default().to_string_lossy();
-        a.input.with_file_name(format!("{stem}_signed.pdf"))
+        a.input.with_file_name(match format {
+            Format::Cades => format!("{name}.csig"),
+            Format::Xades | Format::Facturae => format!("{stem}_signed.xsig"),
+            Format::Auto | Format::Pades => format!("{stem}_signed.pdf"),
+        })
     });
     if output.exists() && !a.force {
         bail!("{} already exists (use --force to overwrite it)", output.display());
     }
+    let config: Config = store.config()?;
+    let level = sign_level(&a, &config, format)?;
 
     if a.dry_run {
-        return dry_run(store, &user, &input, &output, &a);
+        return dry_run(&user, &input, &output, &a, &config, format, level);
     }
 
     let pdf_password = match pdf_password(&a.pdf_password_file)? {
         Some(p) => Some(p),
-        None if pdf::source::Source::needs_password(&input) => Some(prompt_secret("PDF password: ", "--pdf-password-file or $FIRMA_PDF_PASSWORD")?),
+        None if format == Format::Pades && pdf::source::Source::needs_password(&input) => {
+            Some(prompt_secret("PDF password: ", "--pdf-password-file or $FIRMA_PDF_PASSWORD")?)
+        }
         None => None,
     };
     let pdf_password = pdf_password.as_deref();
 
-    let mut cred = match &user.meta.system_cert {
-        Some(sha1) => Credential::system(sha1)?,
-        None => {
+    let mut cred = match (&user.meta.system_cert, &user.meta.pkcs11_cert) {
+        (Some(sha1), _) => Credential::system(sha1)?,
+        (None, Some(sha1)) => {
+            let module = token_module(&user)?;
+            // The prompt names the document, like the Touch ID / Windows Hello dialog.
+            let path = fs::canonicalize(&a.input).unwrap_or_else(|_| a.input.clone());
+            Credential::token(&module, sha1, |req| {
+                if let Some(w) = req.warning {
+                    eprintln!("warning: {w}");
+                }
+                let prompt = format!(
+                    "PIN of {} to sign “{}” as {}: ",
+                    dialog_text(req.token),
+                    dialog_text(&path.to_string_lossy()),
+                    dialog_text(&user.meta.holder)
+                );
+                read_password(&a.password, &prompt)
+            })?
+        }
+        (None, None) => {
             let p12 = fs::read(user.cert_path()).context("the user has no certificate")?;
             let password = read_password(&a.password, &format!("Certificate password for '{}': ", a.user))?;
             Credential::load(&p12, &password)?
@@ -623,6 +802,47 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         keystore::verify_presence(&reason)?;
     }
 
+    let tsa = if level >= Level::T { Some(tsa_settings(&a, &config)?) } else { None };
+
+    // With network access (B-T and up) the chain is completed through AIA and embedded in the
+    // signature: many .p12 files only contain the end-entity certificate.
+    if level >= Level::T {
+        let chain = revocation::build_chain(&cred.cert_der, &cred.chain_der)?;
+        for der in chain.into_iter().skip(1) {
+            if !cred.chain_der.contains(&der) {
+                cred.chain_der.push(der);
+            }
+        }
+    }
+
+    // Signature time-stamp (B-T and up): requested over the signature value.
+    let tsa_token: std::cell::RefCell<Option<tsa::Token>> = Default::default();
+    let timestamp = |signature: &[u8]| -> Result<Vec<u8>> {
+        let tsa = tsa.as_ref().unwrap();
+        let token = tsa.stamp(signature).with_context(|| format!("time-stamp from {}", tsa.url))?;
+        let der = token.der.clone();
+        *tsa_token.borrow_mut() = Some(token);
+        Ok(der)
+    };
+
+    let date = chrono::Local::now();
+    if format != Format::Pades {
+        let timestamper: Option<cms::Timestamper> = tsa.is_some().then_some(&timestamp);
+        let out = match format {
+            Format::Cades => cms::sign_cades(&cred, &input, !a.detached, date.into(), timestamper)?,
+            Format::Facturae => xades::sign(&cred, &input, xades::Profile::Facturae, date, timestamper)?,
+            _ => xades::sign(&cred, &input, xades::Profile::Xades, date, timestamper)?,
+        };
+        fs::write(&output, out).with_context(|| format!("writing {}", output.display()))?;
+        let details = match tsa_token.into_inner() {
+            Some(t) => format!(": time-stamp {}", t.time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")),
+            None => String::new(),
+        };
+        let detached = if a.detached { ", detached" } else { "" };
+        println!("Signed by {} → {} ({}{detached}{details})", info.holder, output.display(), level.name(format));
+        return Ok(());
+    }
+
     let signature = user.signature();
     // A field with no handwritten signature to put in it shows the stamp.
     let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some() || (a.field.is_some() && signature.is_none());
@@ -634,15 +854,6 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         stamp_at.push("last:bottom-left".parse()?);
     }
 
-    let config: Config = store.config()?;
-    let level = match (a.level, &config.level) {
-        (Some(l), _) => l,
-        (None, Some(l)) => Level::parse(l)?,
-        (None, None) => Level::B,
-    };
-    let tsa = if level >= Level::T { Some(tsa_settings(&a, &config)?) } else { None };
-
-    let date = chrono::Local::now();
     let stamp_text = stamp.then(|| {
         a.text
             .as_deref()
@@ -675,26 +886,6 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
         SignatureKind::Vector => GraphicSource::Vector(p),
     });
 
-    // With network access (B-T and up) the chain is completed through AIA and embedded in the
-    // signature: many .p12 files only contain the end-entity certificate.
-    if level >= Level::T {
-        let chain = revocation::build_chain(&cred.cert_der, &cred.chain_der)?;
-        for der in chain.into_iter().skip(1) {
-            if !cred.chain_der.contains(&der) {
-                cred.chain_der.push(der);
-            }
-        }
-    }
-
-    // Signature time-stamp (B-T and up): requested over the signature value.
-    let tsa_token: std::cell::RefCell<Option<tsa::Token>> = Default::default();
-    let timestamp = |signature: &[u8]| -> Result<Vec<u8>> {
-        let tsa = tsa.as_ref().unwrap();
-        let token = tsa.stamp(signature).with_context(|| format!("time-stamp from {}", tsa.url))?;
-        let der = token.der.clone();
-        *tsa_token.borrow_mut() = Some(token);
-        Ok(der)
-    };
     let timestamper: Option<pdf::sign::Timestamper> = tsa.is_some().then_some(&timestamp);
     let signed = pdf::sign::sign_pdf(&input, pdf_password, &cred, graphic, &opts, timestamper)?;
     let mut out = signed.pdf;
@@ -741,27 +932,74 @@ fn sign_cmd(store: &Store, a: SignArgs) -> Result<()> {
 
     fs::write(&output, out).with_context(|| format!("writing {}", output.display()))?;
     let details = if details.is_empty() { String::new() } else { format!(": {}", details.join(", ")) };
-    println!("Signed by {} → {} ({}{details})", info.holder, output.display(), level.name());
+    println!("Signed by {} → {} ({}{details})", info.holder, output.display(), level.name(format));
     Ok(())
 }
 
-/// `firma sign --dry-run`: validates the request and describes it, without touching the certificate.
-fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs) -> Result<()> {
-    if let Some(sha1) = &user.meta.system_cert {
-        if !keystore::list()?.iter().any(|c| &c.sha1 == sha1) {
-            bail!("{}'s certificate is no longer in the {} (see `firma certs`)", a.user, keystore::STORE);
-        }
+/// Rejects options that do not apply to the signature format.
+fn check_format_args(format: Format, a: &SignArgs) -> Result<()> {
+    if a.detached && format != Format::Cades {
+        bail!("--detached is only for CAdES signatures (--format cades)");
     }
-    let config = store.config()?;
+    if format == Format::Pades {
+        return Ok(());
+    }
+    let pdf_only = [
+        ("--at", !a.at.is_empty()),
+        ("--stamp", a.stamp),
+        ("--stamp-at", !a.stamp_at.is_empty()),
+        ("--field", a.field.is_some()),
+        ("--allow-overlap", a.allow_overlap),
+        ("--text", a.text.is_some()),
+        ("--reason", a.reason.is_some()),
+        ("--location", a.location.is_some()),
+        ("--contact", a.contact.is_some()),
+        ("--pkcs7", a.pkcs7),
+        ("--pdf-password-file", a.pdf_password_file.is_some()),
+        ("--reserve", a.reserve.is_some()),
+    ];
+    let given: Vec<&str> = pdf_only.iter().filter(|(_, on)| *on).map(|(name, _)| *name).collect();
+    if !given.is_empty() {
+        let what = if a.format == Format::Auto { format!("{} is not a PDF", a.input.display()) } else { "the format is not PAdES".to_string() };
+        bail!("{} only appl{} to PDFs, and {what}", given.join(", "), if given.len() == 1 { "ies" } else { "y" });
+    }
+    Ok(())
+}
+
+/// The level to sign at: --level, else `firma config`, else B-B. Other formats than PAdES stop at
+/// B-T: a configured LT or LTA becomes B-T, and asking for it explicitly is an error.
+fn sign_level(a: &SignArgs, config: &Config, format: Format) -> Result<Level> {
     let level = match (a.level, &config.level) {
         (Some(l), _) => l,
         (None, Some(l)) => Level::parse(l)?,
         (None, None) => Level::B,
     };
+    if format == Format::Pades || level <= Level::T {
+        return Ok(level);
+    }
+    if a.level.is_some() {
+        bail!("{} signatures can be B-B or B-T (--level b or t); LT and LTA are only for PDFs", format.label());
+    }
+    eprintln!("note: the configured level is {}, but LT and LTA are only for PDFs; signing at B-T", format!("{level:?}").to_lowercase());
+    Ok(Level::T)
+}
+
+/// `firma sign --dry-run`: validates the request and describes it, without touching the certificate.
+fn dry_run(user: &User, input: &[u8], output: &Path, a: &SignArgs, config: &Config, format: Format, level: Level) -> Result<()> {
+    if let Some(sha1) = &user.meta.system_cert {
+        if !keystore::list()?.iter().any(|c| &c.sha1 == sha1) {
+            bail!("{}'s certificate is no longer in the {} (see `firma certs`)", a.user, keystore::STORE);
+        }
+    }
+    if let Some(sha1) = &user.meta.pkcs11_cert {
+        if !pkcs11::list(&token_module(user)?)?.iter().any(|c| &c.id.sha1 == sha1) {
+            bail!("{}'s certificate is not on any token (is the card in the reader? see `firma certs --pkcs11`)", a.user);
+        }
+    }
     let signature = user.signature();
     // A field with no handwritten signature to put in it shows the stamp.
     let stamp = a.stamp || !a.stamp_at.is_empty() || a.text.is_some() || (a.field.is_some() && signature.is_none());
-    if !a.at.is_empty() && signature.is_none() && !stamp {
+    if format == Format::Pades && !a.at.is_empty() && signature.is_none() && !stamp {
         bail!("user '{}' has no handwritten signature; add one with `firma user signature` or use --stamp", a.user);
     }
     let mut stamp_at = a.stamp_at.clone();
@@ -771,10 +1009,16 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
 
     println!("Dry run: nothing has been signed.");
     println!("  signer:      {} ({}), certificate by {}, expires {}", a.user, user.meta.holder, user.meta.issuer, user.meta.expires);
-    println!("  input:       {}", a.input.display());
-    println!("  output:      {}{}", output.display(), if output.exists() { " (exists, --force given)" } else { "" });
-    println!("  level:       {}", level.name());
+    // File names can carry terminal control sequences; this summary is what the user approves.
+    println!("  input:       {}", dialog_text(&a.input.to_string_lossy()));
+    let exists = if output.exists() { " (exists, --force given)" } else { "" };
+    println!("  output:      {}{exists}", dialog_text(&output.to_string_lossy()));
+    println!("  level:       {}", level.name(format));
     let approval = match &user.meta.system_cert {
+        None if user.meta.pkcs11_cert.is_some() && a.password.password_file.is_some() => {
+            "the card's PIN, from --password-file".to_string()
+        }
+        None if user.meta.pkcs11_cert.is_some() => "the card's PIN, typed in the terminal (or on the reader's PIN pad)".to_string(),
         Some(_) if user.meta.presence_check() => {
             format!("{} ({}); the dialog names the document", keystore::PRESENCE, keystore::STORE)
         }
@@ -784,8 +1028,28 @@ fn dry_run(store: &Store, user: &User, input: &[u8], output: &Path, a: &SignArgs
     };
     println!("  approval:    {approval}");
     if level >= Level::T {
-        let tsa = tsa_settings_no_secret(a, &config);
+        let tsa = tsa_settings_no_secret(a, config);
         println!("  TSA:         {tsa}");
+    }
+    match format {
+        Format::Cades => {
+            let how = if a.detached { "detached: the signed file must be kept next to it" } else { "the signed file goes inside it" };
+            println!("  file:        {} bytes; {how}", input.len());
+            return Ok(());
+        }
+        Format::Xades | Format::Facturae => {
+            let root = xades::root(input)?;
+            if format == Format::Facturae && !xades::is_facturae(&root) {
+                bail!("not a FacturaE invoice (its root element is {}, not Facturae)", root.0);
+            }
+            let ns = if root.1.is_empty() { String::new() } else { format!(" ({})", root.1) };
+            println!("  XML:         root element {}{ns}; the signature goes inside it", root.0);
+            if format == Format::Facturae {
+                println!("  policy:      FacturaE v3.1, signer role \"emisor\"");
+            }
+            return Ok(());
+        }
+        Format::Auto | Format::Pades => {}
     }
 
     let password = pdf_password(&a.pdf_password_file)?;

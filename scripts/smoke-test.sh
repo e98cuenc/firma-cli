@@ -40,4 +40,21 @@ if "$FIRMA" sign signed2.pdf -u smoke -o signed3.pdf --stamp-at 1:30,160:50x20 2
   echo "signed on top of an existing signature" >&2
   exit 1
 fi
-echo "OK: signed.pdf created ($(wc -c < signed.pdf) bytes)"
+# Other formats: CAdES (attached and detached), XAdES and FacturaE.
+printf 'smoke test\n' > note.txt
+"$FIRMA" sign note.txt -u smoke
+"$FIRMA" sign note.txt -u smoke --detached -o note-detached.csig
+openssl cms -verify -inform DER -in note.txt.csig -CAfile ca.crt -purpose any -out note-out.txt
+cmp note.txt note-out.txt
+openssl cms -verify -inform DER -in note-detached.csig -content note.txt -binary -CAfile ca.crt -purpose any -out /dev/null
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<doc xmlns="urn:smoke"><item>caf\303\251</item></doc>\n' > data.xml
+"$FIRMA" sign data.xml -u smoke
+grep -q "<ds:Signature " data_signed.xsig
+printf '<fe:Facturae xmlns:fe="http://www.facturae.gob.es/formato/Versiones/Facturaev3_2_2.xml"><FileHeader/></fe:Facturae>\n' > invoice.xml
+"$FIRMA" sign invoice.xml -u smoke | grep -q "FacturaE"
+grep -q "politica_de_firma_formato_facturae_v3_1" invoice_signed.xsig
+if "$FIRMA" sign note.txt -u smoke --stamp -o x.csig 2>/dev/null; then
+  echo "accepted a PDF-only option for CAdES" >&2
+  exit 1
+fi
+echo "OK: signed.pdf created ($(wc -c < signed.pdf) bytes), and CAdES, XAdES and FacturaE files"

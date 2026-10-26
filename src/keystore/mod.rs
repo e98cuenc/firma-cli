@@ -109,7 +109,7 @@ pub fn find(query: &str) -> Result<Identity> {
     }
 }
 
-fn select(all: Vec<Identity>, query: &str, now: chrono::DateTime<chrono::Utc>) -> Vec<Identity> {
+pub(crate) fn select(all: Vec<Identity>, query: &str, now: chrono::DateTime<chrono::Utc>) -> Vec<Identity> {
     let hex: String = query.chars().filter(|c| !matches!(c, ' ' | ':')).collect::<String>().to_uppercase();
     if hex.len() >= 8 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
         let by_hash: Vec<Identity> = all.iter().filter(|i| i.sha1.starts_with(&hex)).cloned().collect();
@@ -189,9 +189,8 @@ fn hex_decode(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-/// ECDSA signatures as raw r‖s (what Windows returns) to the DER form CMS uses.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn ecdsa_raw_to_der(alg: KeyAlg, raw: &[u8]) -> Result<Vec<u8>> {
+/// ECDSA signatures as raw r‖s (what Windows and PKCS#11 return) to the DER form CMS uses.
+pub(crate) fn ecdsa_raw_to_der(alg: KeyAlg, raw: &[u8]) -> Result<Vec<u8>> {
     Ok(match alg {
         KeyAlg::P256 => p256::ecdsa::Signature::from_slice(raw)?.to_der().as_bytes().to_vec(),
         KeyAlg::P384 => p384::ecdsa::Signature::from_slice(raw)?.to_der().as_bytes().to_vec(),

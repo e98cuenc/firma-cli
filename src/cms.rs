@@ -1,7 +1,8 @@
-//! Builds the detached CMS/CAdES signature embedded in the PDF.
+//! Builds CMS/CAdES signatures: the detached one embedded in a PDF, and CAdES files.
 //!
 //! Signed attributes (PAdES B-B): content-type, message-digest and
 //! signing-certificate-v2. No signing-time: in PAdES the date goes in /M.
+//! CAdES B-B adds signing-time.
 
 use anyhow::{anyhow, Result};
 use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
@@ -23,6 +24,7 @@ const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 const ID_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 const ID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 const ID_SIGNING_CERT_V2: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47");
+const ID_SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
 
 /// Time-stamper: receives the signature value and returns a DER TimeStampToken.
 pub type Timestamper<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>>;
@@ -38,14 +40,41 @@ pub fn sign_detached(
     document_digest: &[u8],
     timestamp: Option<Timestamper>,
 ) -> Result<Vec<u8>> {
+    build(cred, document_digest, None, None, timestamp)
+}
+
+/// A CAdES signature of `content` (B-B, or B-T with `timestamp`), with the content inside it
+/// (`attached`, AutoFirma's default) or detached.
+pub fn sign_cades(
+    cred: &Credential,
+    content: &[u8],
+    attached: bool,
+    date: std::time::SystemTime,
+    timestamp: Option<Timestamper>,
+) -> Result<Vec<u8>> {
+    let digest = cred.digest().hash(&[content]);
+    let time = x509_cert::time::Time::try_from(date).map_err(|e| anyhow!("signing time: {e}"))?;
+    build(cred, &digest, Some(time), attached.then_some(content), timestamp)
+}
+
+fn build(
+    cred: &Credential,
+    document_digest: &[u8],
+    signing_time: Option<x509_cert::time::Time>,
+    content: Option<&[u8]>,
+    timestamp: Option<Timestamper>,
+) -> Result<Vec<u8>> {
     let digest = cred.digest();
     let digest_alg = AlgorithmIdentifierOwned { oid: digest.oid(), parameters: None };
 
-    let attrs = vec![
+    let mut attrs = vec![
         attribute(ID_CONTENT_TYPE, Any::encode_from(&ID_DATA)?)?,
         attribute(ID_MESSAGE_DIGEST, Any::encode_from(&OctetString::new(document_digest)?)?)?,
         attribute(ID_SIGNING_CERT_V2, Any::from_der(&signing_certificate_v2(&cred.cert_der, &cred.cert)?)?)?,
     ];
+    if let Some(t) = signing_time {
+        attrs.push(attribute(ID_SIGNING_TIME, Any::encode_from(&t)?)?);
+    }
     let signed_attrs: SignedAttributes = SetOfVec::try_from(attrs)?;
     let signature = cred.sign(&signed_attrs.to_der()?)?;
 
@@ -82,7 +111,10 @@ pub fn sign_detached(
     let signed_data = SignedData {
         version: CmsVersion::V1,
         digest_algorithms: DigestAlgorithmIdentifiers::try_from(vec![digest_alg])?,
-        encap_content_info: EncapsulatedContentInfo { econtent_type: ID_DATA, econtent: None },
+        encap_content_info: EncapsulatedContentInfo {
+            econtent_type: ID_DATA,
+            econtent: content.map(|c| Any::encode_from(&OctetString::new(c)?)).transpose()?,
+        },
         certificates: Some(CertificateSet::try_from(certs).map_err(|e| anyhow!("{e}"))?),
         crls: None,
         signer_infos: SignerInfos::try_from(vec![signer_info])?,
