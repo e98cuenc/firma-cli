@@ -44,7 +44,7 @@ fi
 printf 'smoke test\n' > note.txt
 "$FIRMA" sign note.txt -u smoke
 "$FIRMA" sign note.txt -u smoke --detached -o note-detached.csig
-openssl cms -verify -inform DER -in note.txt.csig -CAfile ca.crt -purpose any -out note-out.txt
+openssl cms -verify -inform DER -in note.txt.csig -binary -CAfile ca.crt -purpose any -out note-out.txt
 cmp note.txt note-out.txt
 openssl cms -verify -inform DER -in note-detached.csig -content note.txt -binary -CAfile ca.crt -purpose any -out /dev/null
 printf '<?xml version="1.0" encoding="UTF-8"?>\n<doc xmlns="urn:smoke"><item>caf\303\251</item></doc>\n' > data.xml
