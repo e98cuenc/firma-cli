@@ -3,6 +3,7 @@
   "description": "Digitally sign PDFs (PAdES, an AutoFirma alternative) with your own certificate, via the firma CLI",
   "version": "0.3.0",
   "author": { "name": "Joaquín Cuenca Abela" },
+  "license": "MIT",
   "homepage": "https://github.com/e98cuenc/firma-cli",
   "repository": "https://github.com/e98cuenc/firma-cli",
   "keywords": ["pdf", "signature", "pades", "autofirma", "certificate"]

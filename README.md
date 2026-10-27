@@ -274,3 +274,7 @@ firma config --tsa http://timestamp.digicert.com
 - PKCS#11 tokens are tested with SoftHSM (RSA, EC and always-authenticate keys), not with a physical DNIe.
 - CAdES, XAdES and FacturaE stop at level B-T (no LT/LTA), and there is no co-signing of an existing CAdES file
   or counter-signing. XAdES is enveloped only (no detached or enveloping XAdES).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
