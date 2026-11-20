@@ -1,17 +1,4 @@
-mod ber;
-mod cert;
-mod cms;
-mod keystore;
-mod net;
-mod pdf;
-mod pkcs11;
-mod preview;
-mod revocation;
-mod store;
-mod tsa;
-mod verify;
-mod xades;
-mod xml;
+use firma::{cert, cms, keystore, pdf, pkcs11, preview, revocation, store, tsa, xades};
 
 use std::fs;
 use std::io::{BufRead, Write};
