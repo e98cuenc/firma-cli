@@ -164,8 +164,8 @@ pub fn load(sha1: &str) -> Result<(SystemKey, Vec<u8>, Vec<Vec<u8>>)> {
 /// Asks the user to confirm with Touch ID / Windows Hello (or their account password).
 /// `reason` completes "firma is trying to …" in the dialog.
 pub fn verify_presence(reason: &str) -> Result<()> {
-    // Only in debug builds, for automated tests: release builds always ask.
-    #[cfg(debug_assertions)]
+    // Only with the `test-hooks` feature, for automated tests: normal builds always ask.
+    #[cfg(feature = "test-hooks")]
     if std::env::var_os("FIRMA_TEST_SKIP_PRESENCE").is_some() {
         eprintln!("(test) presence check skipped: {reason}");
         return Ok(());

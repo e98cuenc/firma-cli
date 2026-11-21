@@ -19,9 +19,9 @@ fn identities() -> Result<Vec<SecIdentity>> {
     let mut opts = ItemSearchOptions::new();
     opts.class(ItemClass::identity()).limit(Limit::All).load_refs(true);
     // Tests use a throwaway keychain instead of the user's.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-hooks")]
     let _keychain;
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-hooks")]
     if let Some(path) = std::env::var_os("FIRMA_TEST_KEYCHAIN") {
         _keychain = [security_framework::os::macos::keychain::SecKeychain::open(path)?];
         opts.keychains(&_keychain);

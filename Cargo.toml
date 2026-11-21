@@ -6,6 +6,12 @@ rust-version = "1.87"
 license = "MIT"
 description = "Command-line electronic signatures (PAdES, CAdES, XAdES, FacturaE), an alternative to AutoFirma"
 
+[features]
+# Test-only hooks: $FIRMA_TEST_SKIP_PRESENCE skips Touch ID / Windows Hello and
+# $FIRMA_TEST_KEYCHAIN uses a throwaway keychain. Never enable them in a build
+# that people use, nor in a program that depends on firma.
+test-hooks = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

@@ -27,14 +27,14 @@ if [ "$(uname -s)" = Darwin ] && openssl version | grep -q "^OpenSSL 3"; then le
 
 case "$(uname -s)" in
   Darwin)
-    # Debug builds (tests) read $FIRMA_TEST_KEYCHAIN instead of the user's keychains.
+    # With the test-hooks feature, $FIRMA_TEST_KEYCHAIN replaces the user's keychains.
     KC="$WORK/test.keychain"
     trap 'security delete-keychain "$KC" 2>/dev/null; rm -rf "$WORK"' EXIT
     security create-keychain -p test "$KC"
     security unlock-keychain -p test "$KC"
     security set-keychain-settings "$KC"
     security import "$WORK/u.p12" -k "$KC" -P test -A
-    FIRMA_TEST_KEYCHAIN="$KC" cargo test --locked -- --ignored system
+    FIRMA_TEST_KEYCHAIN="$KC" cargo test --locked --features test-hooks -- --ignored system
     ;;
   MINGW* | MSYS* | CYGWIN*)
     trap 'certutil -user -delstore My "$FIRMA_TEST_SYSTEM_CERT" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
@@ -42,7 +42,7 @@ case "$(uname -s)" in
     for csp in "" "Microsoft Enhanced RSA and AES Cryptographic Provider"; do
       echo "== import ${csp:-(default provider)}"
       certutil -user -f -p test ${csp:+-csp "$csp"} -importpfx My "$(cygpath -w "$WORK/u.p12")" NoRoot >/dev/null
-      cargo test --locked -- --ignored system
+      cargo test --locked --features test-hooks -- --ignored system
 
       "$FIRMA" certs | grep "$FIRMA_TEST_SYSTEM_CERT"
       "$FIRMA" user remove sys --yes 2>/dev/null || true
