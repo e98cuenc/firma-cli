@@ -30,6 +30,18 @@ const FACTURAE_POLICY_SHA1: &str = "Ohixl6upD6av8N7pEvDABhEL6hM=";
 pub enum Profile {
     Xades,
     Facturae,
+    /// XAdES-EPES with another signature policy (e.g. TicketBAI's).
+    Epes(Policy),
+}
+
+/// An explicit signature policy: its identifier (URL or OID) and the SHA-256 of the policy
+/// document, Base64.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Policy {
+    pub identifier: &'static str,
+    pub sha256: &'static str,
+    /// Role claimed by the signer (e.g. "emisor"), if any.
+    pub role: Option<&'static str>,
 }
 
 /// Root element of an XML document (local name, namespace), or an error if it is not XML that
@@ -95,8 +107,9 @@ pub fn sign(
     let cert_digest = b64(&digest.hash(&[&cred.cert_der]));
     let tbs = &cred.cert.tbs_certificate;
     let signing_cert = match profile {
-        // The FacturaE policy predates SigningCertificateV2.
-        Profile::Facturae => format!(
+        // The FacturaE policy predates SigningCertificateV2; SigningCertificate is also the one
+        // every explicit policy accepts.
+        Profile::Facturae | Profile::Epes(_) => format!(
             "<xades:SigningCertificate><xades:Cert><xades:CertDigest><ds:DigestMethod Algorithm=\"{digest_uri}\"></ds:DigestMethod>\
              <ds:DigestValue>{cert_digest}</ds:DigestValue></xades:CertDigest><xades:IssuerSerial>\
              <ds:X509IssuerName>{}</ds:X509IssuerName><ds:X509SerialNumber>{}</ds:X509SerialNumber>\
@@ -120,10 +133,25 @@ pub fn sign(
                  <ds:DigestValue>{FACTURAE_POLICY_SHA1}</ds:DigestValue></xades:SigPolicyHash></xades:SignaturePolicyId>\
                  </xades:SignaturePolicyIdentifier>"
             ),
-            "<xades:SignerRole><xades:ClaimedRoles><xades:ClaimedRole>emisor</xades:ClaimedRole></xades:ClaimedRoles></xades:SignerRole>",
+            "<xades:SignerRole><xades:ClaimedRoles><xades:ClaimedRole>emisor</xades:ClaimedRole></xades:ClaimedRoles></xades:SignerRole>".to_string(),
             "<xades:Description>Factura electrónica</xades:Description>",
         ),
-        Profile::Xades => (String::new(), "", ""),
+        Profile::Epes(p) => (
+            format!(
+                "<xades:SignaturePolicyIdentifier><xades:SignaturePolicyId><xades:SigPolicyId>\
+                 <xades:Identifier>{}</xades:Identifier></xades:SigPolicyId><xades:SigPolicyHash>\
+                 <ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"></ds:DigestMethod>\
+                 <ds:DigestValue>{}</ds:DigestValue></xades:SigPolicyHash></xades:SignaturePolicyId>\
+                 </xades:SignaturePolicyIdentifier>",
+                xml::escape(p.identifier),
+                xml::escape(p.sha256),
+            ),
+            p.role
+                .map(|r| format!("<xades:SignerRole><xades:ClaimedRoles><xades:ClaimedRole>{}</xades:ClaimedRole></xades:ClaimedRoles></xades:SignerRole>", xml::escape(r)))
+                .unwrap_or_default(),
+            "",
+        ),
+        Profile::Xades => (String::new(), String::new(), ""),
     };
     let signed_props = xml::canonicalize(
         &format!(
